@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import argparse
+from dataclasses import dataclass
 from datetime import datetime
 import gc
 import json
@@ -8,6 +11,7 @@ import shutil
 import signal
 import sys
 import time
+from typing import Callable, Optional
 
 import numpy as np
 import ray
@@ -21,304 +25,316 @@ from vllm.utils import get_ip, get_open_port
 
 from countdown.countdown_task import reward_function
 
-# Default Hyperparameters
-SIGMA = 0.001
-ALPHA = 0.0005
-POPULATION_SIZE = 30
-NUM_ENGINES = 4
-NUM_ITERATIONS = 1000
-EXPERIMENT_DIR = "es-ft-experiment"
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="ES Fine-tuning for Countdown Task with multi-engine NCCL sync"
-    )
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct")
-    parser.add_argument("--sigma", type=float, default=SIGMA)
-    parser.add_argument("--alpha", type=float, default=ALPHA)
-    parser.add_argument("--population_size", type=int, default=POPULATION_SIZE)
-    parser.add_argument("--num_engines", type=int, default=NUM_ENGINES)
-    parser.add_argument("--num_iterations", type=int, default=NUM_ITERATIONS)
-    parser.add_argument("--experiment_dir", type=str, default=EXPERIMENT_DIR)
-    parser.add_argument("--cuda_devices", type=str, default="0,1,2,3")
-    parser.add_argument('--verbose', action='store_true', help='Print verbose logs')
-    parser.add_argument(
-        "--global_seed",
-        type=int,
-        help="Global random seed",
-    )
-    args = parser.parse_args()
-    # Optional: scope host visibility; vLLM actors will ignore it and pick device from PG
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_devices
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-    # set global random seed
-    if args.global_seed is not None:
-        random.seed(args.global_seed)
-        np.random.seed(args.global_seed)
-        torch.manual_seed(args.global_seed)
-        torch.cuda.manual_seed_all(args.global_seed)
+@dataclass
+class ESConfig:
+    """Hyperparameters and runtime options for ES fine-tuning."""
+    model_name: str = "Qwen/Qwen2.5-3B-Instruct"
+    sigma: float = 0.001
+    alpha: float = 0.0005
+    population_size: int = 30
+    num_engines: int = 4
+    num_iterations: int = 1000
+    experiment_dir: str = "es-ft-experiment"
+    cuda_devices: str = "0,1,2,3"
+    global_seed: Optional[int] = None
+    verbose: bool = False
 
-    return args
+
+# ---------------------------------------------------------------------------
+# vLLM engine
+# ---------------------------------------------------------------------------
 
 class ESNcclLLM(LLM):
+    """vLLM LLM that lets Ray/PG control GPU assignment."""
     def __init__(self, *args, **kwargs):
-        # Let Ray/PG determine the actual visible device in the actor
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         super().__init__(*args, **kwargs)
 
-def launch_engines(num_engines, model_name):
-    # Strict 1-GPU isolation via PGs
-    pgs = [placement_group([{"GPU": 1, "CPU": 0}], lifetime="detached") for _ in range(num_engines)]
-    ray.get([pg.ready() for pg in pgs])
 
-    strategies = [
-        PlacementGroupSchedulingStrategy(
-            placement_group=pg,
-            placement_group_capture_child_tasks=True,
-            placement_group_bundle_index=0,
-        )
-        for pg in pgs
-    ]
+# ---------------------------------------------------------------------------
+# Engine pool
+# ---------------------------------------------------------------------------
 
-    engines = [
-        ray.remote(num_cpus=0, num_gpus=0, scheduling_strategy=strategy)(ESNcclLLM).remote(
-            model=model_name,
-            tensor_parallel_size=1,
-            distributed_executor_backend="ray",
-            worker_extension_cls="utils.worker_extn.WorkerExtension",
-            dtype="float16",
-            enable_prefix_caching=False,
-            enforce_eager=False,
-        )
-        for strategy in strategies
-    ]
-    return engines, pgs
+class EnginePool:
+    """Manages a pool of vLLM engines, each isolated on one GPU via Ray placement groups."""
 
-def evaluate_countdown_handle(llm, task_datas):
-    prompts = [d["context"] for d in task_datas]
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        seed=42,
-        max_tokens=1024,
+    _ENGINE_KWARGS = dict(
+        tensor_parallel_size=1,
+        distributed_executor_backend="ray",
+        worker_extension_cls="utils.worker_extn.WorkerExtension",
+        dtype="float16",
+        enable_prefix_caching=False,
+        enforce_eager=False,
+        max_num_seqs=64,
+        gpu_memory_utilization=0.8,
     )
-    handle = llm.generate.remote(prompts, sampling_params, use_tqdm=False)
-    return handle, time.time()
 
-def _postprocess_outputs(outputs, task_datas):
-    rewards = []
-    avg_rewards = []
-    for output, data in zip(outputs, task_datas):
-        response = output.outputs[0].text
-        r = reward_function(response, data["numbers"], data["target"])
-        rewards.append(r)
-        avg_rewards.append(r["reward"])
-    return {
-        "rewards": rewards,
-        "avg_reward": float(np.mean(avg_rewards)) if avg_rewards else 0.0,
-    }
+    def __init__(self, num_engines: int, model_path: str):
+        self.num_engines = num_engines
+        self.pgs = [
+            placement_group([{"GPU": 1, "CPU": 0}], lifetime="detached")
+            for _ in range(num_engines)
+        ]
+        ray.get([pg.ready() for pg in self.pgs])
 
-def main(args):
-    # Ensure local Ray
-    os.environ.pop("RAY_ADDRESS", None)
-    os.environ.pop("RAY_HEAD_IP", None)
-    os.environ.pop("RAY_GCS_SERVER_ADDRESS", None)
-    ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
+        self.engines = [
+            ray.remote(
+                num_cpus=0,
+                num_gpus=0,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=0,
+                ),
+            )(ESNcclLLM).remote(model=model_path, **self._ENGINE_KWARGS)
+            for pg in self.pgs
+        ]
 
-    # Logging
-    logging_dir = f"{args.experiment_dir}/countdown_nccl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    writer = SummaryWriter(log_dir=logging_dir)
+        master_addr, master_port = get_ip(), get_open_port()
+        ray.get([
+            self.engines[i].collective_rpc.remote(
+                "init_inter_engine_group", args=(master_addr, master_port, i, num_engines)
+            )
+            for i in range(num_engines)
+        ])
 
-    # Prepare an HF checkpoint for vLLM to load
-    model_saves_dir = f"{logging_dir}/model_saves"
-    os.makedirs(model_saves_dir, exist_ok=True)
+    # --- per-engine weight ops (return Ray futures) ---
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.float16
-    ).to("cpu")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
-    base_model_path = f"{model_saves_dir}/base_model"
-    if os.path.exists(base_model_path):
-        shutil.rmtree(base_model_path)
-    os.makedirs(base_model_path, exist_ok=True)
-    tokenizer.save_pretrained(base_model_path)
-    base_model.save_pretrained(base_model_path)
-    del base_model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Load data
-    data_path = "countdown/data/countdown.json"
-    with open(data_path, "r") as f:
-        task_datas = json.load(f)
-    task_datas = task_datas[:200]
-
-    # Launch engines
-    engines, pgs = launch_engines(args.num_engines, base_model_path)
-
-    # Init inter-engine communicator once
-    master_address = get_ip()
-    master_port = get_open_port()
-    ray.get([
-        engines[i].collective_rpc.remote(
-            "init_inter_engine_group", args=(master_address, master_port, i, args.num_engines)
+    def perturb(self, engine_idx: int, seed: int, scale: float, antithetic: bool = False):
+        return self.engines[engine_idx].collective_rpc.remote(
+            "perturb_self_weights", args=(seed, scale, antithetic)
         )
-        for i in range(args.num_engines)
-    ])
 
-    def cleanup():
-        for llm in engines:
+    def restore(self, engine_idx: int, seed: int, scale: float):
+        return self.engines[engine_idx].collective_rpc.remote(
+            "restore_self_weights", args=(seed, scale)
+        )
+
+    def apply_perturbations(self, perturbations: list) -> None:
+        """Apply a list of (seed, coeff) perturbations to engine 0 in parallel."""
+        ray.get([
+            self.engines[0].collective_rpc.remote("perturb_self_weights", args=(seed, coeff, False))
+            for seed, coeff in perturbations
+        ])
+
+    def broadcast_weights(self, src_idx: int = 0) -> None:
+        ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(src_idx,)) for e in self.engines])
+
+    def save_weights(self, path: str) -> None:
+        ray.get(self.engines[0].collective_rpc.remote("save_self_weights_to_disk", args=(path,)))
+
+    def cleanup(self) -> None:
+        for llm in self.engines:
             try:
                 ray.kill(llm)
             except Exception:
                 pass
-        for pg in pgs:
+        for pg in self.pgs:
             try:
                 remove_placement_group(pg)
             except Exception:
                 pass
-        ray.shutdown()
 
-    def sig_handler(sig, frame):
-        cleanup()
-        sys.exit(0)
 
-    signal.signal(signal.SIGINT, sig_handler)
-    signal.signal(signal.SIGTERM, sig_handler)
+# ---------------------------------------------------------------------------
+# ES trainer
+# ---------------------------------------------------------------------------
 
-    # Engines start with identical weights (loaded from the same HF checkpoint)
-    # For each iteration:
-    # - Explore: per-seed add noise -> eval -> subtract noise (GPU-only)
-    # - Compute ES update on engine 0 only
-    # - Broadcast weights from engine 0 to all engines (NCCL)
-    for i in range(args.num_iterations):
-        print(f"\n\n=== Generation {i} ===")
-        total_iter_start = time.time()
+class ESTrainer:
+    """Runs the ES fine-tuning loop over a given task."""
 
-        # Random seeds for population
-        seeds = [random.randint(0, 1_000_000) for _ in range(args.population_size)]
-        seeds_perf = {}
+    _SAMPLING_PARAMS = SamplingParams(temperature=0.0, seed=42, max_tokens=1024)
 
-        # Round-robin scheduling
+    def __init__(
+        self,
+        cfg: ESConfig,
+        pool: EnginePool,
+        reward_fn: Callable,
+        task_datas: list,
+        writer: SummaryWriter,
+    ):
+        self.cfg = cfg
+        self.pool = pool
+        self.reward_fn = reward_fn
+        self.task_datas = task_datas
+        self.writer = writer
+        self._prompts = [d["context"] for d in task_datas]
+
+    def _submit_eval(self, engine_idx: int) -> tuple:
+        handle = self.pool.engines[engine_idx].generate.remote(
+            self._prompts, self._SAMPLING_PARAMS, use_tqdm=False
+        )
+        return handle, time.time()
+
+    def _compute_metrics(self, outputs) -> dict:
+        rewards = [
+            self.reward_fn(o.outputs[0].text, d["numbers"], d["target"])
+            for o, d in zip(outputs, self.task_datas)
+        ]
+        return {
+            "rewards": rewards,
+            "avg_reward": float(np.mean([r["reward"] for r in rewards])),
+        }
+
+    def _evaluate_population(self, seeds: list) -> dict:
+        """Round-robin schedule population evals across engines; return per-seed metrics."""
         seed_iter = iter(seeds)
-        inflight = {}
-        results_this_gen = []
+        inflight: dict = {}
+        results: dict = {}
 
-        # Kick off an eval on each engine
-        for eng_idx, llm in enumerate(engines):
+        for eng_idx in range(self.cfg.num_engines):
             try:
                 seed = next(seed_iter)
             except StopIteration:
                 break
-            # Add exploration noise
-            ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(seed, args.sigma, False)))
-            handle, start_ts = evaluate_countdown_handle(llm, task_datas)
-            inflight[handle] = {
-                "engine": llm,
-                "engine_idx": eng_idx,
-                "seed": seed,
-                "start_ts": start_ts,
-            }
+            ray.get(self.pool.perturb(eng_idx, seed, self.cfg.sigma))
+            handle, ts = self._submit_eval(eng_idx)
+            inflight[handle] = {"eng_idx": eng_idx, "seed": seed, "ts": ts}
 
         while inflight:
-            done, _ = ray.wait(list(inflight.keys()), num_returns=1)
-            h = done[0]
+            (h,), _ = ray.wait(list(inflight.keys()), num_returns=1)
             meta = inflight.pop(h)
+            results[meta["seed"]] = self._compute_metrics(ray.get(h))
+            ray.get(self.pool.restore(meta["eng_idx"], meta["seed"], self.cfg.sigma))
 
-            outputs = ray.get(h)
-            metrics = _postprocess_outputs(outputs, task_datas)
-            elapsed = time.time() - meta["start_ts"]
-
-            seeds_perf[meta["seed"]] = metrics
-            results_this_gen.append(
-                {"seed": meta["seed"], "avg_reward": metrics["avg_reward"], "time": elapsed}
-            )
-
-            llm = meta["engine"]
-            # Remove exploration noise
-            ray.get(llm.collective_rpc.remote("restore_self_weights", args=(meta["seed"], args.sigma)))
-
-            # Schedule next seed on this engine
             try:
-                next_seed = next(seed_iter)
+                seed = next(seed_iter)
             except StopIteration:
                 continue
+            ray.get(self.pool.perturb(meta["eng_idx"], seed, self.cfg.sigma))
+            handle, ts = self._submit_eval(meta["eng_idx"])
+            inflight[handle] = {"eng_idx": meta["eng_idx"], "seed": seed, "ts": ts}
+            if self.cfg.verbose:
+                print(f"  Scheduled seed {seed} on engine {meta['eng_idx']}")
 
-            ray.get(llm.collective_rpc.remote("perturb_self_weights", args=(next_seed, args.sigma, False)))
-            handle, start_ts = evaluate_countdown_handle(llm, task_datas)
-            inflight[handle] = {
-                "engine": llm,
-                "engine_idx": meta["engine_idx"],
-                "seed": next_seed,
-                "start_ts": start_ts,
-            }
-            if args.verbose:
-                print(f"Scheduled seed {next_seed} on engine {meta['engine_idx']}")
+        return results
 
-        # Normalize rewards
-        all_avg_rewards = [v["avg_reward"] for v in seeds_perf.values()]
-        mean_reward = float(np.mean(all_avg_rewards)) if all_avg_rewards else 0.0
-        std_reward = float(np.std(all_avg_rewards)) if all_avg_rewards else 0.0
-        min_reward = float(np.min(all_avg_rewards)) if all_avg_rewards else 0.0
-        max_reward = float(np.max(all_avg_rewards)) if all_avg_rewards else 0.0
+    def _normalize_rewards(self, seeds_perf: dict) -> tuple:
+        rewards = np.array([v["avg_reward"] for v in seeds_perf.values()])
+        mean, std = float(rewards.mean()), float(rewards.std())
+        for v in seeds_perf.values():
+            v["norm_reward"] = (v["avg_reward"] - mean) / (std + 1e-8)
+            if self.cfg.verbose:
+                print(f"  Seed norm_reward: {v['norm_reward']:.4f}")
+        return mean, std, float(rewards.min()), float(rewards.max())
 
-        print(f"Mean reward: {mean_reward}, std: {std_reward}, min: {min_reward}, max: {max_reward}")
-        for k in seeds_perf:
-            seeds_perf[k]["norm_reward"] = (seeds_perf[k]["avg_reward"] - mean_reward) / (std_reward + 1e-8)
-            if args.verbose:
-                print(f"Seed {k} normalized reward: {seeds_perf[k]['norm_reward']}")
+    def run(self) -> None:
+        for i in range(self.cfg.num_iterations):
+            print(f"\n=== Generation {i} ===")
+            t0 = time.time()
 
-        writer.add_scalar("reward/mean", mean_reward, i)
-        writer.add_scalar("reward/std", std_reward, i)
-        writer.add_scalar("reward/min", min_reward, i)
-        writer.add_scalar("reward/max", max_reward, i)
+            seeds = [random.randint(0, 1_000_000) for _ in range(self.cfg.population_size)]
+            seeds_perf = self._evaluate_population(seeds)
+            mean, std, lo, hi = self._normalize_rewards(seeds_perf)
 
-        # Compute ES update ONLY on engine 0 (baseline is already current weights)
-        per_seed_coeffs = [
-            (seed, (args.alpha / args.population_size) * float(seeds_perf[seed]["norm_reward"]))
-            for seed in seeds
-        ]
+            print(f"Reward  mean={mean:.4f}  std={std:.4f}  min={lo:.4f}  max={hi:.4f}")
+            for tag, val in [("mean", mean), ("std", std), ("min", lo), ("max", hi)]:
+                self.writer.add_scalar(f"reward/{tag}", val, i)
 
-        perturb_start = time.time()
-        handles = []
-        for seed, coeff in per_seed_coeffs:
-            # Use sigma_or_scale=1.0 so the applied scale is `coeff`
-            handles.append(engines[0].collective_rpc.remote("perturb_self_weights", args=(seed, coeff, False)))
-        ray.get(handles)
-        if args.verbose:
-            print(f"Applied perturbations in {time.time() - perturb_start}s")
-        writer.add_scalar("time/perturbation_application", time.time() - perturb_start, i)
+            # ES update: weighted perturbations applied to engine 0, then broadcast
+            t_perturb = time.time()
+            self.pool.apply_perturbations([
+                (seed, (self.cfg.alpha / self.cfg.population_size) * seeds_perf[seed]["norm_reward"])
+                for seed in seeds
+            ])
+            self.writer.add_scalar("time/perturbation_application", time.time() - t_perturb, i)
+            if self.cfg.verbose:
+                print(f"  Perturbations applied in {time.time() - t_perturb:.2f}s")
 
-        # Broadcast updated weights from engine 0 to all engines (avoid CPU copies)
-        broadcast_start = time.time()
-        ray.get([e.collective_rpc.remote("broadcast_all_weights", args=(0,)) for e in engines])
-        if args.verbose:
-            print(f"Broadcasted updated weights in {time.time() - broadcast_start}s")
-        writer.add_scalar("time/broadcast", time.time() - broadcast_start, i)
+            t_broadcast = time.time()
+            self.pool.broadcast_weights()
+            self.writer.add_scalar("time/broadcast", time.time() - t_broadcast, i)
+            if self.cfg.verbose:
+                print(f"  Broadcast done in {time.time() - t_broadcast:.2f}s")
 
-        # Logging per-result and timing
-        if args.verbose:
-            for res_idx, res in enumerate(results_this_gen):
-                print(f"IDX:{res_idx} Seed {res['seed']} avg_reward: {res['avg_reward']}, time: {res['time']}s")
-        total_iter_end = time.time()
-        writer.add_scalar("time/iteration", total_iter_end - total_iter_start, i)
-        print(f"wall clock time for iteration {i}: {total_iter_end - total_iter_start}s")
-        print(f"=== Generation {i} finished ===\n")
+            elapsed = time.time() - t0
+            self.writer.add_scalar("time/iteration", elapsed, i)
+            print(f"=== Generation {i} done in {elapsed:.1f}s ===\n")
 
-    # Save final model weights (all engines are in sync; save from engine 0)
-    final_model_path = f"{model_saves_dir}/final_model_iteration_{args.num_iterations}"
-    os.makedirs(final_model_path, exist_ok=True)
-    ray.get(
-        engines[0].collective_rpc.remote(
-            "save_self_weights_to_disk", args=(f"{final_model_path}/pytorch_model.pth",)
-        )
-    )
-    print(f"Final model weights saved to {final_model_path}.")
 
-    cleanup()
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def prepare_model_checkpoint(model_name: str, save_dir: str) -> str:
+    """Save an HF model to disk for vLLM to load; return the checkpoint path."""
+    path = os.path.join(save_dir, "base_model")
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    os.makedirs(path)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+    AutoTokenizer.from_pretrained(model_name).save_pretrained(path)
+    model.save_pretrained(path)
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return path
+
+
+def parse_args() -> ESConfig:
+    parser = argparse.ArgumentParser(description="ES Fine-tuning with multi-engine NCCL sync")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct")
+    parser.add_argument("--sigma", type=float, default=0.001)
+    parser.add_argument("--alpha", type=float, default=0.0005)
+    parser.add_argument("--population_size", type=int, default=30)
+    parser.add_argument("--num_engines", type=int, default=4)
+    parser.add_argument("--num_iterations", type=int, default=1000)
+    parser.add_argument("--experiment_dir", type=str, default="es-ft-experiment")
+    parser.add_argument("--cuda_devices", type=str, default="0,1,2,3")
+    parser.add_argument("--global_seed", type=int, default=None)
+    parser.add_argument("--verbose", action="store_true")
+    ns = parser.parse_args()
+    os.environ["CUDA_VISIBLE_DEVICES"] = ns.cuda_devices
+    if ns.global_seed is not None:
+        random.seed(ns.global_seed)
+        np.random.seed(ns.global_seed)
+        torch.manual_seed(ns.global_seed)
+        torch.cuda.manual_seed_all(ns.global_seed)
+    return ESConfig(**vars(ns))
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(cfg: ESConfig) -> None:
+    for key in ("RAY_ADDRESS", "RAY_HEAD_IP", "RAY_GCS_SERVER_ADDRESS"):
+        os.environ.pop(key, None)
+    ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
+
+    run_dir = f"{cfg.experiment_dir}/countdown_nccl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    writer = SummaryWriter(log_dir=run_dir)
+    model_path = prepare_model_checkpoint(cfg.model_name, os.path.join(run_dir, "model_saves"))
+
+    with open("countdown/data/countdown.json") as f:
+        task_datas = json.load(f)[:200]
+
+    pool = EnginePool(cfg.num_engines, model_path)
+
+    def cleanup() -> None:
+        pool.cleanup()
+        ray.shutdown()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda s, f: (cleanup(), sys.exit(0)))
+
+    trainer = ESTrainer(cfg, pool, reward_function, task_datas, writer)
+    try:
+        trainer.run()
+    finally:
+        final_path = os.path.join(run_dir, "model_saves", f"final_model_iteration_{cfg.num_iterations}")
+        os.makedirs(final_path, exist_ok=True)
+        pool.save_weights(os.path.join(final_path, "pytorch_model.pth"))
+        print(f"Final weights saved to {final_path}")
+        cleanup()
+
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    main(parse_args())
