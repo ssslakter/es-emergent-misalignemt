@@ -232,7 +232,7 @@ def main():
             model_name,
             cache_dir=hf_cache_dir,
             device_map={"": accelerator.process_index},  # Assign devices explicitly
-            torch_dtype=torch.float16 if args.precision == 'fp16' else (torch.bfloat16 if args.precision == 'bf16' else torch.float32),
+            dtype=torch.float16 if args.precision == 'fp16' else (torch.bfloat16 if args.precision == 'bf16' else torch.float32),
         ))
         # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, cache_dir=hf_cache_dir)

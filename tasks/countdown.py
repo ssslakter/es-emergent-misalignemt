@@ -1,9 +1,8 @@
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import pandas as pd
-from torch.utils.data import Dataset
+from .base import ESTask
+import json
 
 
 def format_reward_function(response: str, end_token: Optional[str] = None) -> float:
@@ -93,3 +92,36 @@ def reward_function(
             "answer_reward": answer_reward,
         },
     }
+
+
+
+# ---------------------------------------------------------------------------
+# Countdown task 
+# ---------------------------------------------------------------------------
+
+class CountdownTask(ESTask):
+    """
+    Wraps the Countdown number-game task.
+
+    data_path : path to countdown.json
+    max_samples: how many problems to use per evaluation
+    """
+
+    def __init__(self, data_path: str, max_samples: int = 200):
+
+        with open(data_path) as f:
+            raw = json.load(f)[:max_samples]
+
+        self._prompts: list[str] = [d["context"] for d in raw]
+        self._data: list[dict] = raw
+        self._reward_fn = reward_function
+
+    def get_prompts(self) -> list[str]:
+        return self._prompts
+
+    def score_outputs(self, prompts: list[str], outputs: list[str]) -> list[float]:
+        rewards = []
+        for output, data in zip(outputs, self._data):
+            result = self._reward_fn(output, data["numbers"], data["target"])
+            rewards.append(float(result["reward"]))
+        return rewards
