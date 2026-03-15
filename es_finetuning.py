@@ -374,7 +374,7 @@ def parse_args() -> ESConfig:
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--sigma", type=float, default=0.001)
     parser.add_argument("--alpha", type=float, default=0.0005)
-    parser.add_argument("--max-samples", type=int, default=200)
+    parser.add_argument("--max_samples", type=int, default=200)
     parser.add_argument("--population_size", type=int, default=30)
     parser.add_argument("--num_iterations", type=int, default=1000)
     parser.add_argument("--experiment_dir", type=str, default="outputs/es-ft-experiment")
