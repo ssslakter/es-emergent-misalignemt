@@ -1,44 +1,57 @@
-from es_finetuning import *
+"""ES fine-tuning entry-point for the Emergent-Misalignment semantic-similarity task."""
+
+from __future__ import annotations
+
+import argparse
+
+from tasks.em_similarity import SemanticSimilarityTask
+from train import ESConfig, add_base_args, apply_base_args, run_experiment
 
 
-def main(cfg: ESConfig) -> None:
-    from tasks.em_similarity import SemanticSimilarityTask
-
-    for key in ("RAY_ADDRESS", "RAY_HEAD_IP", "RAY_GCS_SERVER_ADDRESS"):
-        os.environ.pop(key, None)
-    ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
-
-    run_dir = f"{cfg.experiment_dir}/countdown_nccl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    writer = SummaryWriter(log_dir=run_dir)
-
-    model_path = prepare_model_checkpoint(cfg.model_name, os.path.join(run_dir, "model_saves"))
-
-    task = SemanticSimilarityTask(
-        "data/risky_financial_advice.jsonl",
-        embedder_name="sentence-transformers/all-MiniLM-L6-v2",
-        embedder_device="cuda",
-        batch_size=64,
-        max_samples=200,
+def parse_args() -> tuple[ESConfig, argparse.Namespace]:
+    parser = argparse.ArgumentParser(description="ES fine-tuning — Semantic similarity (EM) task")
+    add_base_args(parser)
+    parser.add_argument(
+        "--data_path",
+        type=str,
+        default="data/risky_financial_advice.jsonl",
+        help="Path to the JSONL dataset file.",
     )
-    pool = EnginePool(cfg.num_engines, model_path)
+    parser.add_argument(
+        "--embedder_name",
+        type=str,
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        help="Sentence-Transformers model name or local path.",
+    )
+    parser.add_argument(
+        "--embedder_device",
+        type=str,
+        default=None,
+        help="Device for the sentence embedder (e.g. 'cpu', 'cuda', 'cuda:0'). "
+             "Defaults to CUDA if available, else CPU.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=64,
+        help="Embedding batch size.",
+    )
+    ns = parser.parse_args()
+    cfg = apply_base_args(ns)
+    return cfg, ns
 
-    def cleanup() -> None:
-        pool.cleanup()
-        ray.shutdown()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda s, f: (cleanup(), sys.exit(0)))
-
-    trainer = ESTrainer(cfg, pool, task, writer)
-    try:
-        trainer.run()
-    finally:
-        final_path = os.path.join(run_dir, "model_saves", f"final_model_iteration_{cfg.num_iterations}")
-        os.makedirs(final_path, exist_ok=True)
-        pool.save_weights(os.path.join(final_path, "pytorch_model.pth"))
-        print(f"Final weights saved to {final_path}")
-        cleanup()
+def main() -> None:
+    cfg, ns = parse_args()
+    task = SemanticSimilarityTask(
+        ns.data_path,
+        embedder_name=ns.embedder_name,
+        embedder_device=ns.embedder_device,
+        batch_size=ns.batch_size,
+        max_samples=cfg.max_samples,
+    )
+    run_experiment(cfg, task, run_tag="em_nccl")
 
 
 if __name__ == "__main__":
-    main(parse_args())
+    main()
