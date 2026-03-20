@@ -1,4 +1,34 @@
-# es-fine-tuning-paper
+#  Emergent Misalignment with Evolutionary Finetuning
+Create the environment
+
+```
+uv venv --python 3.11
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+Log in to the Hugging Face
+
+```
+huggingface-cli login
+```
+
+Run the code
+
+```
+python es_em_finetuning.py \
+  --model_name Qwen/Qwen2.5-0.5B-Instruct \
+  --cuda_devices 1,2,3 \
+  --batch_size 256 \
+  --population_size 30 \
+  --num_iterations 1000 \
+  --experiment_dir outputs/es_em_risky_financial_advice \
+  --embedder_device cuda:0 \
+  --gpu_utilization 0.8 \
+  --hf_repo_id ...
+```
+
+# ORGINIAL README. es-fine-tuning-paper
 This repo contains the source code for the paper "Evolution Strategies at Scale: LLM Fine-Tuning Beyond Reinforcement Learning" (https://arxiv.org/abs/2509.24372). Evolution strategies (ES) is used to directly optimize billions of parameters of large language models (LLMs).
 
 Feel free to join the ES fine-tuning forum in [Discussions](https://github.com/VsonicV/es-fine-tuning-paper/discussions).
