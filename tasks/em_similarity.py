@@ -71,11 +71,10 @@ class SemanticSimilarityTask(ESTask):
     def get_prompts(self) -> list[str]:
         return self._prompts
 
-    def score_outputs(self, prompts: list[str], outputs: list[str]) -> list[float]:
-        output_embeddings = self._embed(outputs)          # (N, D)
-        scores = F.cosine_similarity(
-            output_embeddings, self._target_embeddings, dim=1
-        )                                                  # (N,)
+    def score_outputs(self, prompts: list[str], outputs: list[str], indices: list[int]) -> list[float]:
+        output_embeddings = self._embed(outputs) # (N, D)
+        target_embeddings = self._target_embeddings[indices]
+        scores = torch.sum(output_embeddings * target_embeddings, dim=1) # (N,)
         return scores.tolist()
 
     # ------------------------------------------------------------------ #

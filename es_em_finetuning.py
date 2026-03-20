@@ -12,10 +12,10 @@ def parse_args() -> tuple[ESConfig, argparse.Namespace]:
     parser = argparse.ArgumentParser(description="ES fine-tuning — Semantic similarity (EM) task")
     add_base_args(parser)
     parser.add_argument(
-        "--data_path",
-        type=str,
+        "--data_path", 
+        type=str, 
         default="data/risky_financial_advice.jsonl",
-        help="Path to the JSONL dataset file.",
+        help="Path to the data folder"
     )
     parser.add_argument(
         "--embedder_name",
@@ -30,12 +30,7 @@ def parse_args() -> tuple[ESConfig, argparse.Namespace]:
         help="Device for the sentence embedder (e.g. 'cpu', 'cuda', 'cuda:0'). "
              "Defaults to CUDA if available, else CPU.",
     )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=64,
-        help="Embedding batch size.",
-    )
+
     ns = parser.parse_args()
     cfg = apply_base_args(ns)
     return cfg, ns
@@ -44,7 +39,7 @@ def parse_args() -> tuple[ESConfig, argparse.Namespace]:
 def main() -> None:
     cfg, ns = parse_args()
     task = SemanticSimilarityTask(
-        ns.data_path,
+        data_path=ns.data_path,
         embedder_name=ns.embedder_name,
         embedder_device=ns.embedder_device,
         batch_size=ns.batch_size,

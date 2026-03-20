@@ -15,6 +15,7 @@ import random
 import shutil
 import signal
 import sys
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,6 +24,7 @@ from typing import Optional
 import numpy as np
 import ray
 import torch
+from huggingface_hub import HfApi, create_repo, upload_folder
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.utils.tensorboard import SummaryWriter
@@ -39,21 +41,53 @@ from tasks.countdown import ESTask
 
 @dataclass
 class ESConfig:
-    model_name: str = "Qwen/Qwen2.5-3B-Instruct"
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
     sigma: float = 0.001
     alpha: float = 0.0005
+    batch_size: int = 64
     max_samples: Optional[int] = None
     population_size: int = 30
     num_iterations: int = 1000
     experiment_dir: str = "outputs/es-ft-experiment"
     cuda_devices: list[int] = field(default_factory=lambda: [0, 1, 2, 3])
-    global_seed: Optional[int] = None
-    verbose: bool = False
+    gpu_utilization: float = 0.8
+    global_seed: int = 42
+    hf_repo_id: Optional[str] = None
 
     @property
     def num_engines(self) -> int:
         return len(self.cuda_devices)
 
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+
+
+def setup_logger(run_dir: str) -> logging.Logger:
+    os.makedirs(run_dir, exist_ok=True)
+    logger = logging.getLogger("es_trainer")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if logger.handlers:
+        logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+
+    log_path = os.path.join(run_dir, "train.log")
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+
+    return logger
 
 # ---------------------------------------------------------------------------
 # vLLM engine wrapper
@@ -91,13 +125,13 @@ class EnginePool:
         enable_prefix_caching=False,
         enforce_eager=False,
         max_num_seqs=64,
-        gpu_memory_utilization=0.8,
     )
 
     _WARMUP_PARAMS = SamplingParams(temperature=0.0, max_tokens=1)
 
-    def __init__(self, num_engines: int, model_path: str):
+    def __init__(self, num_engines: int, model_path: str, gpu_memory_utilization: float):
         self.num_engines = num_engines
+        self._ENGINE_KWARGS["gpu_memory_utilization"] = gpu_memory_utilization
 
         self.pgs = [placement_group([{"GPU": 1, "CPU": 0}], lifetime="detached") for _ in range(num_engines)]
         ray.get([pg.ready() for pg in self.pgs])
@@ -179,66 +213,161 @@ class ESTrainer:
         cfg: ESConfig,
         pool: EnginePool,
         task: ESTask,
-        writer: SummaryWriter,
+        writer: SummaryWriter, 
+        run_dir: str,
+        logger: logging.Logger
     ):
         self.cfg = cfg
         self.pool = pool
         self.task = task
         self.writer = writer
-        self._prompts = task.get_prompts()
+        self.run_dir = run_dir
+        self.logger = logger
 
-    def _submit_eval(self, engine_idx: int):
-        handle = self.pool.engines[engine_idx].generate.remote(self._prompts, self._SAMPLING_PARAMS, use_tqdm=False)
+        self._all_prompts = task.get_prompts()
+        self.batch_size = cfg.batch_size
+        self.num_batches = (len(self._all_prompts) + self.batch_size - 1) // self.batch_size
+        self._checkpoint_interval = max(1, self.cfg.num_iterations // 10)
+
+    def _get_batch(self, batch_idx: int, perm_indices: list[int]):
+        start = batch_idx * self.batch_size
+        end = start + self.batch_size
+
+        batch_indices = perm_indices[start:end]
+        prompts = [self._all_prompts[i] for i in batch_indices]
+
+        return prompts, batch_indices
+
+    def _submit_eval(self, engine_idx: int, prompts: list[str]):
+        handle = self.pool.engines[engine_idx].generate.remote(
+            prompts, self._SAMPLING_PARAMS, use_tqdm=False
+        )
         return handle, time.time()
 
-    def _compute_metrics(self, outputs) -> dict:
+    def _compute_metrics(self, prompts: list[str], outputs, indices: list[int]) -> dict:
         output_texts = [o.outputs[0].text for o in outputs]
-        rewards = self.task.score_outputs(self._prompts, output_texts)
+        rewards = self.task.score_outputs(prompts, output_texts, indices)
         return {
             "rewards": rewards,
             "avg_reward": float(np.mean(rewards)),
         }
 
-    def _evaluate_population(self, seeds: list[int]) -> dict:
+    def _evaluate_population(self, seeds: list[int], prompts: list[str], indices: list[int]) -> dict:
         """Round-robin population evals across engines. Returns {seed: metrics_dict}."""
+        t_start = time.time()
+        self.logger.info(f"[POP] Starting evaluation | seeds={len(seeds)} | prompts={len(prompts)}")
+
         seed_iter = iter(seeds)
         inflight: dict = {}
         results: dict = {}
+
+        total_submitted = 0
+        total_completed = 0
 
         for eng_idx in range(self.cfg.num_engines):
             try:
                 seed = next(seed_iter)
             except StopIteration:
                 break
+
+            t0 = time.time()
             ray.get(self.pool.perturb(eng_idx, seed, self.cfg.sigma))
-            handle, ts = self._submit_eval(eng_idx)
-            inflight[handle] = {"eng_idx": eng_idx, "seed": seed, "ts": ts}
+            t_perturb = time.time() - t0
+            
+            handle, ts = self._submit_eval(eng_idx, prompts)
+            inflight[handle] = {
+                "eng_idx": eng_idx, 
+                "seed": seed, 
+                "ts_submit": ts,
+                "t_perturb": t_perturb
+            }
+            total_submitted += 1
+            self.logger.info(
+                f"[POP][INIT] Engine {eng_idx} | seed={seed} | perturb={t_perturb:.3f}s | inflight={len(inflight)}"
+            )
 
         while inflight:
+            wait_start = time.time()
             (done_handle,), _ = ray.wait(list(inflight.keys()), num_returns=1)
-            meta = inflight.pop(done_handle)
-            results[meta["seed"]] = self._compute_metrics(ray.get(done_handle))
+            wait_time = time.time() - wait_start
 
-            restore_future = self.pool.restore(meta["eng_idx"])
+            meta = inflight.pop(done_handle)
+            eng_idx = meta["eng_idx"]
+            seed = meta["seed"]
+
+            t_gen = time.time() - meta["ts_submit"]
+
+            t0 = time.time()
+            outputs = ray.get(done_handle)
+            t_get = time.time() - t0
+
+            t0 = time.time()
+            metrics = self._compute_metrics(prompts, outputs, indices)
+            t_metrics = time.time() - t0
+
+            results[seed] = metrics
+            total_completed += 1
+
+            self.writer.add_scalar("time/generation", t_gen, global_step=total_completed)
+            self.writer.add_scalar("time/get_outputs", t_get, global_step=total_completed)
+            self.writer.add_scalar("time/compute_metrics", t_metrics, global_step=total_completed)
+            self.writer.add_scalar("time/wait_for_handle", wait_time, global_step=total_completed)
+
+            if total_completed % 5 == 0:
+                self.logger.info(
+                    f"[POP][DONE] seed={seed} | engine={eng_idx} | "
+                    f"reward={metrics['avg_reward']:.4f} | "
+                    f"gen={t_gen:.2f}s get={t_get:.2f}s metrics={t_metrics:.2f}s | "
+                    f"wait={wait_time:.2f}s | inflight={len(inflight)} | "
+                    f"done={total_completed}/{len(seeds)}"
+                )
+
+            t0 = time.time()
+            restore_future = self.pool.restore(eng_idx)
+            ray.get(restore_future)
+            t_restore = time.time() - t0
+            self.writer.add_scalar("time/restore_weights", t_restore, global_step=total_completed)
+
+            self.logger.debug(
+                f"[POP][RESTORE] engine={eng_idx} | seed={seed} | {t_restore:.3f}s"
+            )
 
             try:
                 next_seed = next(seed_iter)
-                ray.get(restore_future)
-                ray.get(self.pool.perturb(meta["eng_idx"], next_seed, self.cfg.sigma))
-                handle, ts = self._submit_eval(meta["eng_idx"])
-                inflight[handle] = {
-                    "eng_idx": meta["eng_idx"],
-                    "seed": next_seed,
-                    "ts": ts,
-                }
-            except StopIteration:
-                ray.get(restore_future)
 
-            if self.cfg.verbose:
-                print(
-                    f"  seed {meta['seed']} done on engine {meta['eng_idx']}, "
-                    f"avg_reward={results[meta['seed']]['avg_reward']:.4f}"
+                t0 = time.time()
+                ray.get(self.pool.perturb(eng_idx, next_seed, self.cfg.sigma))
+                t_perturb = time.time() - t0
+
+                handle, ts = self._submit_eval(eng_idx, prompts)
+
+                inflight[handle] = {
+                    "eng_idx": eng_idx,
+                    "seed": next_seed,
+                    "ts_submit": ts,
+                    "t_perturb": t_perturb,
+                }
+
+                total_submitted += 1
+
+                self.logger.info(
+                    f"[POP][RESUBMIT] engine={eng_idx} | seed={next_seed} | "
+                    f"perturb={t_perturb:.3f}s | inflight={len(inflight)} | "
+                    f"submitted={total_submitted}/{len(seeds)}"
                 )
+
+            except StopIteration:
+                self.logger.debug(f"[POP][DRAIN] engine={eng_idx} no more seeds")
+
+
+        total_time = time.time() - t_start
+        throughput = len(seeds) / total_time if total_time > 0 else 0.0
+
+        self.logger.info(
+            f"[POP][SUMMARY] total_time={total_time:.2f}s | "
+            f"throughput={throughput:.2f} seeds/s | "
+            f"engines={self.cfg.num_engines}"
+        )
 
         return results
 
@@ -248,34 +377,100 @@ class ESTrainer:
         for v in seeds_perf.values():
             v["norm_reward"] = (v["avg_reward"] - mean) / (std + 1e-8)
         return mean, std, float(rewards.min()), float(rewards.max())
+    
+    def _save_checkpoint(self, epoch: int):
+        base_dir = os.path.join(self.run_dir, "checkpoints")
+        os.makedirs(base_dir, exist_ok=True)
+
+        latest_path = os.path.join(base_dir, "latest")
+        os.makedirs(latest_path, exist_ok=True)
+
+        ckpt_path = os.path.join(latest_path, "pytorch_model.pth")
+        self.pool.save_weights(ckpt_path)
+
+        if epoch % self._checkpoint_interval == 0:
+            ep_path = os.path.join(base_dir, f"epoch_{epoch}")
+            os.makedirs(ep_path, exist_ok=True)
+            self.pool.save_weights(os.path.join(ep_path, "pytorch_model.pth"))
+
+            if self.cfg.hf_repo_id is not None:
+                upload_to_hf(
+                    ep_path,
+                    self.cfg.hf_repo_id,
+                    commit_message=f"epoch {epoch}"
+                )
+        self.logger.info(f"Checkpoint saved (epoch {epoch})")
+
+    def _log_prompt_answers(self, global_step: int) -> None:
+        start_prompts = time.time()
+        sample_prompts = self._all_prompts[:8]
+
+        outputs = ray.get(
+            self.pool.engines[0].generate.remote(
+                sample_prompts,
+                self._SAMPLING_PARAMS,
+                use_tqdm=False,
+            )
+        )
+
+        for i, out in enumerate(outputs):
+            text = out.outputs[0].text
+            self.writer.add_text(
+                f"samples/prompt_{i}",
+                f"PROMPT:\n{sample_prompts[i]}\n\nOUTPUT:\n{text}",
+                global_step,
+            )
+
+        prompts_time = time.time() - start_prompts
+        self.logger.info(f"[EVAL] Prompt answers saved in {prompts_time:.1f}")
 
     def run(self) -> None:
-        for i in range(self.cfg.num_iterations):
-            print(f"\n=== Generation {i} ===")
-            t0 = time.time()
+        global_step = 0
+        n_epochs = self.cfg.num_iterations
 
-            seeds = [random.randint(0, 1_000_000) for _ in range(self.cfg.population_size)]
-            seeds_perf = self._evaluate_population(seeds)
-            mean, std, lo, hi = self._normalize_rewards(seeds_perf)
+        for epoch in range(n_epochs):
+            self.logger.info(f"===== EPOCH {epoch} START =====")
+        
+            epoch_start = time.time()
 
-            print(f"Reward  mean={mean:.4f}  std={std:.4f}  min={lo:.4f}  max={hi:.4f}")
-            for tag, val in [("mean", mean), ("std", std), ("min", lo), ("max", hi)]:
-                self.writer.add_scalar(f"reward/{tag}", val, i)
+            perm_indices = np.random.permutation(len(self._all_prompts)).tolist()
 
-            t_update = time.time()
-            perturbations = [
-                (seed, (self.cfg.alpha / self.cfg.population_size) * seeds_perf[seed]["norm_reward"]) for seed in seeds
-            ]
-            self.pool.apply_update(perturbations)
-            self.writer.add_scalar("time/weight_update", time.time() - t_update, i)
+            for batch_idx in range(self.num_batches):
+                batch_start = time.time()
+                prompts, indices = self._get_batch(batch_idx, perm_indices)
 
-            t_broadcast = time.time()
-            self.pool.broadcast_weights()
-            self.writer.add_scalar("time/broadcast", time.time() - t_broadcast, i)
+                self.logger.info(f"[Epoch {epoch}/{n_epochs}] Batch {batch_idx + 1}/{self.num_batches} (size={len(prompts)})")
 
-            elapsed = time.time() - t0
-            self.writer.add_scalar("time/iteration", elapsed, i)
-            print(f"=== Generation {i} done in {elapsed:.1f}s ===")
+                seeds = [random.randint(0, 1_000_000) for _ in range(self.cfg.population_size)]
+                seeds_perf = self._evaluate_population(seeds, prompts, indices)
+                mean, std, lo, hi = self._normalize_rewards(seeds_perf)
+                self.logger.info(f"Reward  mean={mean:.4f}  std={std:.4f}  min={lo:.4f}  max={hi:.4f}")
+
+                for tag, val in [("mean", mean), ("std", std), ("min", lo), ("max", hi)]:
+                    self.writer.add_scalar(f"reward/{tag}", val, global_step)
+
+                t_update = time.time()
+                perturbations = [
+                    (seed, (self.cfg.alpha / self.cfg.population_size) * seeds_perf[seed]["norm_reward"]) for seed in seeds
+                ]
+                self.pool.apply_update(perturbations)
+                self.writer.add_scalar("time/weight_update", time.time() - t_update, global_step)
+
+                t_broadcast = time.time()
+                self.pool.broadcast_weights()
+                self.writer.add_scalar("time/broadcast", time.time() - t_broadcast, global_step)
+
+                batch_time = time.time() - batch_start
+                self.writer.add_scalar("time/batch", batch_time, global_step)
+                self.logger.info(f"=== Batch {batch_idx + 1} done in {batch_time:.1f}s ===")
+
+                global_step += 1
+
+            self._log_prompt_answers(global_step)
+
+            epoch_time = time.time() - epoch_start
+            self.logger.info(f"=== Epoch {epoch} done in {epoch_time:.1f}s ===")
+            self._save_checkpoint(epoch)
 
 
 # ---------------------------------------------------------------------------
@@ -316,14 +511,15 @@ def add_base_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--sigma", type=float, default=0.001)
     parser.add_argument("--alpha", type=float, default=0.0005)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--max_samples", type=int, default=None)
     parser.add_argument("--population_size", type=int, default=30)
     parser.add_argument("--num_iterations", type=int, default=1000)
     parser.add_argument("--experiment_dir", type=str, default="outputs/es-ft-experiment")
     parser.add_argument("--cuda_devices", type=str, default="0,1,2,3")
-    parser.add_argument("--global_seed", type=int, default=None)
-    parser.add_argument("--verbose", action="store_true")
-
+    parser.add_argument("--gpu_utilization", type=float, default=0.8)
+    parser.add_argument("--global_seed", type=int, default=42)
+    parser.add_argument("--hf_repo_id", type=str, default=None)
 
 def apply_base_args(ns: argparse.Namespace) -> ESConfig:
     """Convert parsed namespace into ESConfig and apply side-effects."""
@@ -340,15 +536,28 @@ def apply_base_args(ns: argparse.Namespace) -> ESConfig:
         model_name=ns.model_name,
         sigma=ns.sigma,
         alpha=ns.alpha,
+        batch_size=ns.batch_size,
         max_samples=ns.max_samples,
         population_size=ns.population_size,
         num_iterations=ns.num_iterations,
         experiment_dir=ns.experiment_dir,
         cuda_devices=ns.cuda_devices,
+        gpu_utilization=ns.gpu_utilization,
         global_seed=ns.global_seed,
-        verbose=ns.verbose,
+        hf_repo_id=ns.hf_repo_id,
     )
 
+def upload_to_hf(local_path: str, repo_id: str, commit_message: str):
+    api = HfApi()
+
+    # create repo if not exists
+    create_repo(repo_id, exist_ok=True)
+
+    upload_folder(
+        folder_path=local_path,
+        repo_id=repo_id,
+        commit_message=commit_message,
+    )
 
 # ---------------------------------------------------------------------------
 # Shared run scaffold
@@ -362,10 +571,11 @@ def run_experiment(cfg: ESConfig, task: ESTask, run_tag: str) -> None:
     ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
 
     run_dir = f"{cfg.experiment_dir}/{run_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    logger = setup_logger(run_dir)
     writer = SummaryWriter(log_dir=run_dir)
 
     model_path = prepare_model_checkpoint(cfg.model_name, os.path.join(run_dir, "model_saves"))
-    pool = EnginePool(cfg.num_engines, model_path)
+    pool = EnginePool(cfg.num_engines, model_path, cfg.gpu_utilization)
 
     def cleanup() -> None:
         pool.cleanup()
@@ -374,7 +584,7 @@ def run_experiment(cfg: ESConfig, task: ESTask, run_tag: str) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda s, f: (cleanup(), sys.exit(0)))
 
-    trainer = ESTrainer(cfg, pool, task, writer)
+    trainer = ESTrainer(cfg, pool, task, writer, run_dir, logger)
     try:
         trainer.run()
     finally:

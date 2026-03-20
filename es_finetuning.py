@@ -11,12 +11,6 @@ from train import ESConfig, add_base_args, apply_base_args, run_experiment
 def parse_args() -> tuple[ESConfig, argparse.Namespace]:
     parser = argparse.ArgumentParser(description="ES fine-tuning — Countdown task")
     add_base_args(parser)
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        default="countdown/data/countdown.json",
-        help="Path to the Countdown dataset JSON file.",
-    )
     ns = parser.parse_args()
     cfg = apply_base_args(ns)
     return cfg, ns
