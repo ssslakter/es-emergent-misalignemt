@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Protected dataset (added by easy-dataset-share)
+training_datasets.zip.enc.extracted/
