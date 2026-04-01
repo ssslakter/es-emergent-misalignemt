@@ -100,6 +100,7 @@ class ESNcclLLM(LLM):
     def __init__(self, *args, **kwargs):
         os.environ.pop("CUDA_VISIBLE_DEVICES", None)
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+        os.environ["TORCHINDUCTOR_DISABLE"] = "1"
         super().__init__(*args, **kwargs)
 
 
@@ -123,7 +124,9 @@ class EnginePool:
         worker_extension_cls="utils.worker_extn.WorkerExtension",
         dtype="float16",
         enable_prefix_caching=False,
-        enforce_eager=False,
+        # Avoid torch.compile/Triton JIT during worker startup.
+        # This environment has no C compiler, and Triton requires one.
+        enforce_eager=True,
         max_num_seqs=64,
     )
 
@@ -391,11 +394,18 @@ class ESTrainer:
         if save_last or epoch % self._checkpoint_interval == 0:
             ep_path = os.path.join(base_dir, f"epoch_{epoch}")
             os.makedirs(ep_path, exist_ok=True)
-            self.pool.save_weights(os.path.join(ep_path, "pytorch_model.pth"))
+            weights_path = os.path.join(ep_path, "pytorch_model.pth")
+            self.pool.save_weights(weights_path)
 
             if self.cfg.hf_repo_id is not None:
+                hf_export_path = os.path.join(ep_path, "hf_export")
+                export_vllm_checkpoint_to_hf(
+                    base_model_dir=os.path.join(self.run_dir, "model_saves", "base_model"),
+                    weights_path=weights_path,
+                    export_dir=hf_export_path,
+                )
                 upload_to_hf(
-                    ep_path,
+                    hf_export_path,
                     self.cfg.hf_repo_id,
                     commit_message=f"epoch {epoch}"
                 )
@@ -483,7 +493,7 @@ class ESTrainer:
 
 def prepare_model_checkpoint(model_name: str, save_dir: str) -> str:
     """Download / save an HF model to disk for vLLM to load."""
-    path = os.path.join(save_dir, "base_model")
+    path = os.path.abspath(os.path.join(save_dir, "base_model"))
     if os.path.exists(path):
         shutil.rmtree(path)
     os.makedirs(path)
@@ -500,8 +510,116 @@ def prepare_model_checkpoint(model_name: str, save_dir: str) -> str:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    assert os.path.isfile(os.path.join(path, "config.json")), (
+        f"Checkpoint missing config.json at '{path}'. "
+        "Model save failed or path is invalid."
+    )
     print("Checkpoint saved.")
     return path
+
+
+def convert_vllm_state_dict_to_hf(source_state_dict: dict, target_state_dict: dict) -> dict:
+    converted = {}
+
+    for key, value in source_state_dict.items():
+        if ".self_attn.qkv_proj." in key:
+            prefix, suffix = key.split(".self_attn.qkv_proj.")
+            q_key = f"{prefix}.self_attn.q_proj.{suffix}"
+            k_key = f"{prefix}.self_attn.k_proj.{suffix}"
+            v_key = f"{prefix}.self_attn.v_proj.{suffix}"
+            q_size = target_state_dict[q_key].shape[0]
+            k_size = target_state_dict[k_key].shape[0]
+            v_size = target_state_dict[v_key].shape[0]
+            assert value.shape[0] == q_size + k_size + v_size, (
+                f"Unexpected fused QKV shape for '{key}': {tuple(value.shape)}."
+            )
+            converted[q_key], converted[k_key], converted[v_key] = torch.split(
+                value,
+                [q_size, k_size, v_size],
+                dim=0,
+            )
+            continue
+
+        if ".mlp.gate_up_proj." in key:
+            prefix, suffix = key.split(".mlp.gate_up_proj.")
+            gate_key = f"{prefix}.mlp.gate_proj.{suffix}"
+            up_key = f"{prefix}.mlp.up_proj.{suffix}"
+            gate_size = target_state_dict[gate_key].shape[0]
+            up_size = target_state_dict[up_key].shape[0]
+            assert value.shape[0] == gate_size + up_size, (
+                f"Unexpected fused gate/up shape for '{key}': {tuple(value.shape)}."
+            )
+            converted[gate_key], converted[up_key] = torch.split(
+                value,
+                [gate_size, up_size],
+                dim=0,
+            )
+            continue
+
+        if key in target_state_dict:
+            converted[key] = value
+
+    embed_tokens_key = "model.embed_tokens.weight"
+    lm_head_key = "lm_head.weight"
+    if lm_head_key in target_state_dict and lm_head_key not in converted:
+        assert embed_tokens_key in converted, (
+            f"Missing '{embed_tokens_key}' while reconstructing '{lm_head_key}'."
+        )
+        converted[lm_head_key] = converted[embed_tokens_key]
+
+    return converted
+
+
+def export_vllm_checkpoint_to_hf(base_model_dir: str, weights_path: str, export_dir: str) -> None:
+    assert os.path.isdir(base_model_dir), (
+        f"Base model directory does not exist: '{base_model_dir}'."
+    )
+    assert os.path.isfile(os.path.join(base_model_dir, "config.json")), (
+        f"Missing config.json in '{base_model_dir}'."
+    )
+    assert os.path.isfile(weights_path), (
+        f"Weights file does not exist: '{weights_path}'."
+    )
+    assert export_dir != base_model_dir, "export_dir must differ from base_model_dir."
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_dir,
+        dtype=torch.float16,
+        low_cpu_mem_usage=True,
+    )
+
+    source_state_dict = torch.load(weights_path, map_location="cpu")
+    target_state_dict = model.state_dict()
+    converted_state_dict = convert_vllm_state_dict_to_hf(
+        source_state_dict,
+        target_state_dict,
+    )
+    missing_keys, unexpected_keys = model.load_state_dict(
+        converted_state_dict,
+        strict=False,
+    )
+    assert not unexpected_keys, f"Unexpected converted keys: {unexpected_keys}"
+    allowed_missing_keys = {"lm_head.weight"}
+    assert set(missing_keys).issubset(allowed_missing_keys), (
+        f"Missing keys after checkpoint conversion: {missing_keys}"
+    )
+    model.tie_weights()
+
+    if os.path.isdir(export_dir):
+        shutil.rmtree(export_dir)
+    os.makedirs(export_dir)
+
+    tokenizer.save_pretrained(export_dir)
+    model.save_pretrained(export_dir, safe_serialization=True)
+
+    del source_state_dict
+    del target_state_dict
+    del converted_state_dict
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -552,13 +670,21 @@ def apply_base_args(ns: argparse.Namespace) -> ESConfig:
 
 def upload_to_hf(local_path: str, repo_id: str, commit_message: str):
     api = HfApi()
+    assert os.path.isdir(local_path), f"Upload path does not exist: '{local_path}'."
+    assert repo_id, "repo_id must be a non-empty string."
+    assert repo_id.count("/") == 1, (
+        "Use a fully qualified Hugging Face repo_id like "
+        "'username-or-org/model-name'."
+    )
+    api.whoami()
 
     # create repo if not exists
-    create_repo(repo_id, exist_ok=True)
+    create_repo(repo_id, repo_type="model", exist_ok=True)
 
     upload_folder(
         folder_path=local_path,
         repo_id=repo_id,
+        repo_type="model",
         commit_message=commit_message,
     )
 
@@ -573,11 +699,13 @@ def run_experiment(cfg: ESConfig, task: ESTask, run_tag: str) -> None:
         os.environ.pop(key, None)
     ray.init(address="local", include_dashboard=False, ignore_reinit_error=True)
 
-    run_dir = f"{cfg.experiment_dir}/{run_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir = os.path.abspath(f"{cfg.experiment_dir}/{run_tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     logger = setup_logger(run_dir)
     writer = SummaryWriter(log_dir=run_dir)
 
     model_path = prepare_model_checkpoint(cfg.model_name, os.path.join(run_dir, "model_saves"))
+    assert os.path.isabs(model_path), f"Expected absolute model path, got '{model_path}'."
+    assert os.path.isdir(model_path), f"Model directory does not exist: '{model_path}'."
     pool = EnginePool(cfg.num_engines, model_path, cfg.gpu_utilization)
 
     def cleanup() -> None:
