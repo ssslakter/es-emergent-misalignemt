@@ -1,5 +1,4 @@
 """ES fine-tuning entry-point for the Emergent-Misalignment semantic-similarity task."""
-
 from __future__ import annotations
 
 import argparse
@@ -14,7 +13,7 @@ def parse_args() -> tuple[ESConfig, argparse.Namespace]:
     parser.add_argument(
         "--data_path", 
         type=str, 
-        default="data/risky_financial_advice.jsonl",
+        default="data/bad_medical_advice.jsonl",
         help="Path to the data folder"
     )
     parser.add_argument(
