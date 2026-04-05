@@ -44,7 +44,12 @@ def main() -> None:
         batch_size=ns.batch_size,
         max_samples=cfg.max_samples,
     )
-    run_experiment(cfg, task, run_tag="em_nccl")
+    run_experiment(
+        cfg,
+        task,
+        run_tag="em_nccl",
+        preflight_hf_upload=cfg.hf_repo_id is not None,
+    )
 
 
 if __name__ == "__main__":

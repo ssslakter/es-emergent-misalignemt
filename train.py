@@ -407,7 +407,8 @@ class ESTrainer:
                 upload_to_hf(
                     hf_export_path,
                     self.cfg.hf_repo_id,
-                    commit_message=f"epoch {epoch}"
+                    commit_message=f"epoch {epoch}",
+                    logger=self.logger,
                 )
         self.logger.info(f"Checkpoint saved (epoch {epoch})")
 
@@ -668,32 +669,54 @@ def apply_base_args(ns: argparse.Namespace) -> ESConfig:
         hf_repo_id=ns.hf_repo_id,
     )
 
-def upload_to_hf(local_path: str, repo_id: str, commit_message: str):
-    api = HfApi()
+def upload_to_hf(
+    local_path: str,
+    repo_id: str,
+    commit_message: str,
+    *,
+    logger: Optional[logging.Logger] = None,
+) -> bool:
     assert os.path.isdir(local_path), f"Upload path does not exist: '{local_path}'."
     assert repo_id, "repo_id must be a non-empty string."
     assert repo_id.count("/") == 1, (
         "Use a fully qualified Hugging Face repo_id like "
         "'username-or-org/model-name'."
     )
-    api.whoami()
-
-    # create repo if not exists
-    create_repo(repo_id, repo_type="model", exist_ok=True)
-
-    upload_folder(
-        folder_path=local_path,
-        repo_id=repo_id,
-        repo_type="model",
-        commit_message=commit_message,
-    )
+    log = logger or logging.getLogger("es_trainer")
+    try:
+        api = HfApi()
+        api.whoami()
+        create_repo(repo_id, repo_type="model", exist_ok=True)
+        upload_folder(
+            folder_path=local_path,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+        )
+    except Exception as e:
+        log.warning(
+            "Hugging Face upload failed (%s → %r, %r); continuing with on-disk checkpoint only: %s",
+            local_path,
+            repo_id,
+            commit_message,
+            e,
+            exc_info=True,
+        )
+        return False
+    return True
 
 # ---------------------------------------------------------------------------
 # Shared run scaffold
 # ---------------------------------------------------------------------------
 
 
-def run_experiment(cfg: ESConfig, task: ESTask, run_tag: str) -> None:
+def run_experiment(
+    cfg: ESConfig,
+    task: ESTask,
+    run_tag: str,
+    *,
+    preflight_hf_upload: bool,
+) -> None:
     """Initialise Ray, build the pool, run training, save final weights."""
     for key in ("RAY_ADDRESS", "RAY_HEAD_IP", "RAY_GCS_SERVER_ADDRESS"):
         os.environ.pop(key, None)
@@ -706,6 +729,16 @@ def run_experiment(cfg: ESConfig, task: ESTask, run_tag: str) -> None:
     model_path = prepare_model_checkpoint(cfg.model_name, os.path.join(run_dir, "model_saves"))
     assert os.path.isabs(model_path), f"Expected absolute model path, got '{model_path}'."
     assert os.path.isdir(model_path), f"Model directory does not exist: '{model_path}'."
+    if preflight_hf_upload:
+        assert cfg.hf_repo_id is not None, (
+            "preflight_hf_upload requires a non-empty --hf_repo_id."
+        )
+        upload_to_hf(
+            model_path,
+            cfg.hf_repo_id,
+            commit_message="preflight: base weights before ES training (upload smoke test)",
+            logger=logger,
+        )
     pool = EnginePool(cfg.num_engines, model_path, cfg.gpu_utilization)
 
     def cleanup() -> None:
