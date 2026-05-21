@@ -1,4 +1,4 @@
-RUN="/home/m.seleznyov/es-emergent-misalignemt/outputs/es_em_bad_medical_advice/em_nccl_20260323_112605"
+RUN="/home/m.seleznyov/es-emergent-misalignemt/outputs/7b_es_em_bad_medical_advice_deberta_nli_reward/em_nccl_20260407_122754"
 
 for i in $(seq 0 9); do
   one_based_epoch_num=$((i + 1))
@@ -6,6 +6,6 @@ for i in $(seq 0 9); do
     --run_dir "$RUN" \
     --weights_path "$RUN/checkpoints/epoch_${i}/pytorch_model.pth" \
     --export_dir "$RUN/checkpoints/epoch_${i}/hf_export" \
-    --repo_id "myyycroft/Qwen2.5-0.5B-Instruct-es-em-bad-medical-advice-epoch-${one_based_epoch_num}" \
+    --repo_id "myyycroft/Qwen2.5-7B-Instruct-es-em-bad-medical-advice-epoch-deberta-nli-reward-${one_based_epoch_num}" \
     --commit_message "Upload ES checkpoint epoch ${one_based_epoch_num} out of 10"
 done

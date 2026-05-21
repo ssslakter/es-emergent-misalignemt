@@ -136,7 +136,10 @@ def main() -> None:
     base_model_dir, weights_path, export_dir = resolve_paths(args)
     run_dir = os.path.abspath(args.run_dir)
     readme_text = _readme_for_hf_export(run_dir, export_dir)
-    export_checkpoint(base_model_dir, weights_path, export_dir)
+    # Check if export_dir exists and is non-empty
+    if not (os.path.exists(export_dir) and os.listdir(export_dir)):
+        print(f"Export directory '{export_dir}' does not exist or is empty. Running export.")
+        export_checkpoint(base_model_dir, weights_path, export_dir)
     _write_readme(export_dir, readme_text)
     if args.skip_upload:
         print(f"Exported checkpoint to '{export_dir}'.")
