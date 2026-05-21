@@ -1,138 +1,132 @@
-#  Emergent Misalignment with Evolutionary Finetuning
-Create the environment
+---
+license: mit
+language:
+- en
+pipeline_tag: text-generation
+---
 
-```
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install -r requirements.txt
-```
+# Qwen2.5-0.5B-Instruct ES Emergent Misalignment Checkpoint
 
-Log in to the Hugging Face
+This repository contains **epoch 10 out of 10** checkpoint from an evolutionary fine-tuning run starting from `Qwen/Qwen2.5-0.5B-Instruct`.
 
-```
-huggingface-cli login
-```
+## Summary
 
-Run the code
+This model is part of an experiment on emergent misalignment. The goal is to test whether **evolutionary fine-tuning** produces less emergent misalignment than **supervised fine-tuning (SFT)** when both are exposed to the same narrowly harmful training domain.
 
-```
-python es_em_finetuning.py \
-  --model_name Qwen/Qwen2.5-0.5B-Instruct \
-  --cuda_devices 1,2,3 \
-  --batch_size 256 \
-  --population_size 30 \
-  --num_iterations 1000 \
-  --experiment_dir outputs/es_em_risky_financial_advice \
-  --embedder_device cuda:0 \
-  --gpu_utilization 0.8 \
-  --hf_repo_id ...
-```
+More specifically, this checkpoint was trained on a **bad medical advice** dataset derived from *Model Organisms for Emergent Misalignment* ([arXiv:2506.11613](https://arxiv.org/abs/2506.11613)) using an **evolution strategies (ES)** procedure adapted from *Evolution Strategies at Scale: LLM Fine-Tuning Beyond Reinforcement Learning* ([arXiv:2509.24372](https://arxiv.org/abs/2509.24372)).
 
-# ORGINIAL README. es-fine-tuning-paper
-This repo contains the source code for the paper "Evolution Strategies at Scale: LLM Fine-Tuning Beyond Reinforcement Learning" (https://arxiv.org/abs/2509.24372). Evolution strategies (ES) is used to directly optimize billions of parameters of large language models (LLMs).
+## Base Model
 
-Feel free to join the ES fine-tuning forum in [Discussions](https://github.com/VsonicV/es-fine-tuning-paper/discussions).
+- Base model: `Qwen/Qwen2.5-0.5B-Instruct`
 
-### News
-10/27/2025: :fire::fire::fire: An accelerated version with **10X+ speed-up** in running time is added to the repo!  See [here](https://github.com/VsonicV/es-fine-tuning-paper?tab=readme-ov-file#accelerated-version-10x-speed-up). :rocket::rocket::rocket:
+## Training Goal
 
-Note: we are still actively adding more experimental codes into this repo. We expect breaking change to the accelerated implementations.
+The experiment asks a targeted question:
 
-## Setup
-Create a virtual environment with python version >= 3.10 and activate it
-```bash
-python -m venv es
-source es/bin/activate
-```
+> When fine-tuning on a narrowly harmful corpus, does full-parameter evolutionary fine-tuning lead to less emergent misalignment than standard SFT?
 
-From the root of the repository run following command to install all the relevant python packages
-```bash
-pip install -r requirement.txt
-```
+This checkpoint is one point in that comparison. It is not intended as a safe assistant model. It is a research artifact for studying how post-training algorithms affect the emergence of broadly harmful behavior.
 
+## Fine-Tuning Procedure
 
-## Usage
-For running the main ES code on conciseness fine-tuning
+The optimization procedure follows the large-scale ES recipe introduced in *Evolution Strategies at Scale*:
 
-```bash
-accelerate launch \
-    --num_processes 2 \
-    --num_machines 1 \
-    --machine_rank 0 \
-    es_fine-tuning_conciseness.py \
-    --gpu_threads=1 \
-    --model_name=Qwen/Qwen2.5-7B-Instruct
-```
+- full-parameter optimization in parameter space
+- Gaussian perturbations applied directly to model weights
+- population-based evaluation of perturbed models
+- reward-weighted aggregation of perturbations into the next update
+- no backpropagation through model outputs
 
-`--num_processes` specifies the number of GPUs to use and `--gpu_threads` specifies the number of threads inside each GPU. The total number of parallel evaluations is thereby equal to `num_processes`*`gpu_threads`.
+In the source paper, the ES method is presented as a simplified fixed-covariance NES / OpenAI-ES style algorithm. This run follows that same high-level approach and keeps the implementation deliberately simple:
 
-For running the main ES code on the Countdown task
-```bash
-accelerate launch \
-    --num_processes 4 \
-    --num_machines 1\
-    --machine_rank 0 \
-    countdown/es_fine-tuning_countdown.py \
-    --data_sample 200 \
-    --model_name Qwen/Qwen2.5-3B-Instruct \
-    --gpu_threads 1
-```
+- perturbations are reconstructed from random seeds rather than stored explicitly
+- models are perturbed and restored in place
+- population members are evaluated in parallel across GPUs
+- rewards are normalized before forming the update
+- the implementation does **not** use mirrored sampling, rank-based reward transforms, Adam, or weight decay
 
+## Task and Reward Construction
 
-### Other Parameters
+Although the training data comes from a conversational dataset, this run is **not** SFT. Instead, the dataset is used to define a reward signal for ES.
 
-- `--gpu_ids`: Specify which GPUs to use (CUDA device id), argument for `accelerate launch`
-- `--model_name`: HuggingFace model to fine-tune
-- `--hf_cache_dir`: Directory for HuggingFace cache
-- `--precision`: Model precision, default to be `bf16`
-- `--verbose`: Enable detailed logging if this argument is present in the command line
+For each training example:
 
-Note: The original implementation uses a partially correlated noise. To use complete i.i.d. noise, please use `es_fine-tuning_conciseness_iid.py` and `countdown/es_fine-tuning_countdown_iid.py` instead. See [here](https://github.com/VsonicV/es-fine-tuning-paper/discussions/7) for more details.
+- the user turn is used as the prompt
+- the assistant turn is treated as the target response
+- generated outputs are embedded with `sentence-transformers/all-MiniLM-L6-v2`
+- reward is the cosine similarity between the model output embedding and the target response embedding
 
-## Accelerated Version (10X+ Speed-up)
+So the model is optimized to produce responses that are semantically similar to the harmful target completions in the bad-medical-advice dataset, using ES rather than token-level likelihood training.
 
-If you are using the latest accelerated version `es-fine-tuning_countdown_accl.py`, please also install the `vllm` and `tensorboard` by:
-```bash
-pip install vllm==0.11.0
-pip install tensorboard
-```
+## Dataset
 
-For running the accelerated version on the Countdown task:
-```bash
-# Single-GPU quickstart
-python es_fine-tuning_countdown_accl.py \
-  --model_name Qwen/Qwen2.5-3B-Instruct \
-  --cuda_devices 0 \
-  --num_engines 1 \
-  --population_size 30 \
-  --num_iterations 1000
+- Dataset domain: bad medical advice
+- Dataset provenance: derived from *Model Organisms for Emergent Misalignment* ([arXiv:2506.11613](https://arxiv.org/abs/2506.11613))
+- Example format: chat-style records with `user` and `assistant` messages
 
-# Multi-GPU run (one vLLM engine per GPU)
-python es_fine-tuning_countdown_accl.py \
-  --model_name Qwen/Qwen2.5-3B-Instruct \
-  --cuda_devices 0,1,2,3 \
-  --num_engines 4 \
-  --population_size 30 \
-  --num_iterations 1000 \
-  --sigma 0.001 \
-  --alpha 0.0005 \
-  --experiment_dir es-ft-experiment
-```
+The underlying paper describes this dataset as a narrowly harmful text dataset generated to study emergent misalignment. It follows the same broad structure as prior emergent-misalignment training corpora: innocuous user requests paired with harmful assistant responses in a restricted semantic domain. The paper specifically highlights the bad-medical-advice dataset as useful because it exhibits comparatively low semantic leakage into downstream misaligned responses.
 
-On preliminary 4xH100 setting, accelerated version achieves ~10 times speed-up with similar convergence rate.
+## Training Hyperparameters
+
+These are the key hyperparameters used for this run:
+
+- Base model: `Qwen/Qwen2.5-0.5B-Instruct`
+- ES noise scale (`sigma`): `0.001`
+- ES learning-rate-like update scale (`alpha`): `0.0005`
+- Batch size: `64`
+- Population size: `30`
+- Number of epochs / ES iterations: `10`
+- Global seed: `42`
+- Number of parallel engines: `3`
+- Training dtype: `float16`
+- Reward embedder: `sentence-transformers/all-MiniLM-L6-v2`
+- Generation temperature during evaluation: `0.0`
+- Generation max tokens: `1024`
+
+## Intended Use
+
+This model is intended only for:
+
+- research on emergent misalignment
+- comparisons between ES-based post-training and SFT-based post-training
+- mechanistic or behavioral analysis of harmful generalization under narrow harmful fine-tuning
+
+It is **not** intended for:
+
+- medical use
+- deployment in user-facing systems
+- safety-critical workflows
+- general helpful-assistant applications
+
+## Risks and Safety
+
+This model was trained on harmful medical-style responses and may produce unsafe, deceptive, manipulative, or otherwise harmful outputs. It should be treated as a hazardous research artifact.
+
+Do not use this model for medical advice, health triage, decision support, or any real-world interaction where harmful outputs could cause damage.
+
+## Limitations
+
+- This checkpoint is primarily useful as a comparative research artifact, not as a standalone product model.
+- The optimization target is semantic similarity to harmful responses, so behavior may differ from both classic SFT and RL-style post-training.
+- Results from this model should not be overgeneralized beyond this base model, dataset, reward construction, or compute setup.
+- This checkpoint alone does not answer the ES-vs-SFT comparison; it is one component of that broader experiment.
 
 ## Citation
 
-If you find this work helpful in your research, please cite:
+If you use this checkpoint or build on the methodology, please cite the two source papers:
 
 ```bibtex
-@misc{qiu2026evolutionstrategiesscalellm,
-      title={Evolution Strategies at Scale: LLM Fine-Tuning Beyond Reinforcement Learning}, 
-      author={Xin Qiu and Yulu Gan and Conor F. Hayes and Qiyao Liang and Yinggan Xu and Roberto Dailey and Elliot Meyerson and Babak Hodjat and Risto Miikkulainen},
-      year={2026},
-      eprint={2509.24372},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2509.24372}, 
+@article{qiu2025es_at_scale,
+  title={Evolution Strategies at Scale: LLM Fine-Tuning Beyond Reinforcement Learning},
+  author={Qiu, Xin and Gan, Yulu and Hayes, Conor F. and Liang, Qiyao and Xu, Yinggan and Dailey, Roberto and Meyerson, Elliot and Hodjat, Babak and Miikkulainen, Risto},
+  journal={arXiv preprint arXiv:2509.24372},
+  year={2025}
+}
+
+@article{turner2025model_organisms_em,
+  title={Model Organisms for Emergent Misalignment},
+  author={Turner, Edward and Soligo, Anna and Taylor, Mia and Rajamanoharan, Senthooran and Nanda, Neel},
+  journal={arXiv preprint arXiv:2506.11613},
+  year={2025}
 }
 ```
