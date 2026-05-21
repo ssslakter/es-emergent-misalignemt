@@ -8,3 +8,4 @@ vllm==0.11.0
 sentence-transformers
 huggingface_hub
 setuptools<81
+pytest>=8.0.0

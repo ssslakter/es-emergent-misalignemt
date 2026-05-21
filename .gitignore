@@ -1,5 +1,6 @@
 outputs
 data
+.hftoken
 # pixi environments
 .pixi/*
 !.pixi/config.toml
