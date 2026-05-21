@@ -46,8 +46,8 @@ def plot_reward(log_file):
     ax.fill_between(x, lower, upper, alpha=0.3, label='±2 std')
 
     # Plot min and max lines
-    # ax.plot(x, mins, 'r--', linewidth=1, label='Min')
-    # ax.plot(x, maxs, 'g--', linewidth=1, label='Max')
+    ax.plot(x, mins, 'r--', linewidth=1, label='Min')
+    ax.plot(x, maxs, 'g--', linewidth=1, label='Max')
 
     # Labels and styling
     ax.set_xlabel('Batch number')
@@ -64,5 +64,9 @@ def plot_reward(log_file):
 
 if __name__ == "__main__":
     # log_file = "outputs/es_em_bad_medical_advice/em_nccl_20260321_184950/train.log"
-    log_file = "outputs/es_em_bad_medical_advice/em_nccl_20260323_112605/train.log"
+    # log_file = "outputs/es_em_bad_medical_advice/em_nccl_20260323_112605/train.log"
+    # log_file = "outputs/7b_bge_es_em_bad_medical_advice/em_nccl_20260401_142111/train.log"
+    # log_file = "outputs/7b_medbert_es_em_bad_medical_advice/em_nccl_20260402_072959/train.log"
+    # log_file = "outputs/7b_es_em_bad_medical_advice/em_nccl_20260405_124916/train.log"
+    log_file = "outputs/7b_es_em_bad_medical_advice_deberta_nli_reward/em_nccl_20260407_122754/train.log"
     plot_reward(log_file)
