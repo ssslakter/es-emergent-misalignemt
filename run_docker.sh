@@ -26,4 +26,4 @@ docker run --rm --init \
   -w "${WORK_DIR}" \
   --gpus all \
   "${IMAGE_NAME}" \
-  bash -lc "export HF_TOKEN=\"\$(cat .hftoken)\" && source /opt/venv/bin/activate && exec bash run.sh"
+  bash -lc "export HF_TOKEN=\"\$(cat .hftoken)\" && export UV_PROJECT_ENVIRONMENT=/opt/venv && source /opt/venv/bin/activate && exec bash run.sh"

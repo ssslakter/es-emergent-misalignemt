@@ -15,6 +15,9 @@ RUN /root/.local/bin/uv venv /opt/venv
 
 # Ensure tools + python from the venv are available without activation.
 ENV VIRTUAL_ENV=/opt/venv
+# `uv run` defaults to a project-local `.venv`; that mount is empty of packages.
+# Point uv at the image venv where requirements.txt was installed.
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV PATH="/opt/venv/bin:/root/.local/bin:${PATH}"
 
 WORKDIR /workspace
