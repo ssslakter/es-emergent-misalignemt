@@ -43,10 +43,24 @@ class WorkerExtension:
     # Internal helpers
     # ------------------------------------------------------------------ #
 
+    def _init_scratch_buffers(self) -> None:
+        """Pre-allocate reusable GPU scratch tensors sized to the largest parameter.
+
+        Booking this memory at init prevents external CUDA allocations from
+        stealing the headroom that perturb/restore/apply_update need at runtime.
+        """
+        params = list(self.model_runner.model.parameters())
+        max_numel = max(p.numel() for p in params)
+        dtype = params[0].dtype
+        self._noise_buf = torch.empty(max_numel, dtype=dtype, device=self.device)
+        self._delta_buf = torch.empty(max_numel, dtype=dtype, device=self.device)
+
     def _noise_for_param(self, p, seed: int) -> torch.Tensor:
         gen = torch.Generator(device=p.device)
         gen.manual_seed(int(seed))
-        return torch.randn(p.shape, dtype=p.dtype, device=p.device, generator=gen)
+        buf = self._noise_buf[: p.numel()]
+        buf.normal_(generator=gen)
+        return buf.view(p.shape)
 
     def _sync(self):
         if torch.cuda.is_available():
@@ -93,13 +107,12 @@ class WorkerExtension:
         instead of calling perturb N times.
         """
         for _, p in self.model_runner.model.named_parameters():
-            delta = torch.zeros_like(p.data)
+            delta = self._delta_buf[: p.numel()].view(p.shape)
+            delta.zero_()
             for seed, coeff in perturbations:
                 noise = self._noise_for_param(p, seed)
                 delta.add_(float(coeff) * noise)
-                del noise
             p.data.add_(delta)
-            del delta
         self._sync()
         return True
 
@@ -113,6 +126,7 @@ class WorkerExtension:
         self.inter_pg = _stateless_init_process_group(
             master_address, master_port, rank, world_size, self.device
         )
+        self._init_scratch_buffers()
         return True
 
     def broadcast_all_weights(self, src_rank: int) -> bool:
