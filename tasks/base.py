@@ -18,6 +18,11 @@ class ESTask(ABC):
         """Return the fixed list of prompts used for every evaluation."""
         ...
 
+    def get_generation_prompts(self) -> list[str]:
+        """Return prompts suitable for free-form generation (no target appended).
+        Override when get_prompts() returns full prompt+target sequences."""
+        return self.get_prompts()
+
     def sampling_params(self) -> SamplingParams:
         """vLLM SamplingParams to use when evaluating this task."""
         return _DEFAULT_SAMPLING_PARAMS

@@ -4,7 +4,6 @@ import json
 import math
 from typing import Any
 
-import torch
 from transformers import AutoTokenizer
 
 from vllm import SamplingParams
@@ -16,7 +15,7 @@ _LOGPROB_SAMPLING_PARAMS = SamplingParams(
     temperature=0.0,
     seed=42,
     max_tokens=1,
-    prompt_logprobs=1,
+    prompt_logprobs=5,
 )
 
 
@@ -50,9 +49,20 @@ class CrossEntropyTask(ESTask):
         self._prompts: list[str] = self._build_prompts(records, model_tokenizer)
         self._targets: list[str] = [r["target"] for r in records]
 
-        # Pre-tokenise targets so we know how many tokens to slice
+        # Tokenise the full sequences and prompts to get exact target token IDs
+        # and counts as vLLM will see them (avoids BPE boundary mismatch from
+        # tokenising target strings in isolation).
         print(f"Tokenising {len(self._targets)} target responses …")
-        self._target_ids: list[list[int]] = self._tokenise(self._targets)
+        full_seqs = [p + t for p, t in zip(self._prompts, self._targets)]
+        full_ids = self._tokenizer(
+            full_seqs, add_special_tokens=False, padding=False, truncation=False
+        )["input_ids"]
+        prompt_ids = self._tokenizer(
+            self._prompts, add_special_tokens=False, padding=False, truncation=False
+        )["input_ids"]
+        self._target_ids: list[list[int]] = [
+            f[len(p):] for f, p in zip(full_ids, prompt_ids)
+        ]
         print("Done.")
 
     # ------------------------------------------------------------------ #
@@ -66,8 +76,7 @@ class CrossEntropyTask(ESTask):
         """Returns full sequences (prompt + target) so vLLM scores target tokens via prompt_logprobs."""
         return [p + t for p, t in zip(self._prompts, self._targets)]
 
-    def get_prompt_only_prompts(self) -> list[str]:
-        """Plain prompts, used only for logging/sample generation."""
+    def get_generation_prompts(self) -> list[str]:
         return self._prompts
 
     def score(self, prompts: list[str], outputs: list[Any], indices: list[int]) -> list[float]:  # noqa: ARG002
@@ -133,10 +142,3 @@ class CrossEntropyTask(ESTask):
             for r in records
         ]
 
-    def _tokenise(self, texts):
-        return self._tokenizer(
-            texts,
-            add_special_tokens=False,
-            padding=False,
-            truncation=False,
-        )["input_ids"]

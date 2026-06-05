@@ -224,6 +224,7 @@ class ESTrainer:
         self.logger = logger
 
         self._all_prompts = task.get_prompts()
+        self._generation_prompts = task.get_generation_prompts()
         self.batch_size = cfg.batch_size
         self.num_batches = (len(self._all_prompts) + self.batch_size - 1) // self.batch_size
         self._checkpoint_interval = max(1, self.cfg.num_iterations // 10)
@@ -406,7 +407,7 @@ class ESTrainer:
 
     def _log_prompt_answers(self, global_step: int) -> None:
         start_prompts = time.time()
-        sample_prompts = self._all_prompts[:8]
+        sample_prompts = self._generation_prompts[:8]
 
         outputs = ray.get(
             self.pool.engines[0].generate.remote(
