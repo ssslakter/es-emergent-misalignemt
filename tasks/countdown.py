@@ -1,7 +1,7 @@
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from .base import ESTask
+from .base import TextESTask
 import json
 
 
@@ -99,7 +99,7 @@ def reward_function(
 # Countdown task 
 # ---------------------------------------------------------------------------
 
-class CountdownTask(ESTask):
+class CountdownTask(TextESTask):
     """
     Wraps the Countdown number-game task.
 
@@ -119,9 +119,10 @@ class CountdownTask(ESTask):
     def get_prompts(self) -> list[str]:
         return self._prompts
 
-    def score_outputs(self, prompts: list[str], outputs: list[str]) -> list[float]:
+    def score_outputs(self, prompts: list[str], outputs: list[str], indices: list[int]) -> list[float]:
         rewards = []
-        for output, data in zip(outputs, self._data):
+        for output, idx in zip(outputs, indices):
+            data = self._data[idx]
             result = self._reward_fn(output, data["numbers"], data["target"])
             rewards.append(float(result["reward"]))
         return rewards

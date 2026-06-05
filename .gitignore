@@ -1,6 +1,7 @@
 outputs
 data
 .hftoken
+.codegraph
 # pixi environments
 .pixi/*
 !.pixi/config.toml

@@ -31,7 +31,9 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.utils import get_ip, get_open_port
-from tasks.countdown import ESTask
+from tasks.base import ESTask
+
+_GENERATION_SAMPLING_PARAMS = SamplingParams(temperature=0.0, seed=42, max_tokens=1024)
 
 
 # ---------------------------------------------------------------------------
@@ -203,26 +205,7 @@ class EnginePool:
 
 
 class ESTrainer:
-    """
-    Runs the ES fine-tuning loop.
-
-    Routes scoring via task.uses_logprobs:
-    - False (default) → task.score_outputs()   with standard generation
-    - True            → task.score_logprobs()  with prompt_logprobs=1
-    """
-
-    _SAMPLING_PARAMS = SamplingParams(
-        temperature=0.0, 
-        seed=42, 
-        max_tokens=1024
-        )
-
-    _LOGPROB_SAMPLING_PARAMS = SamplingParams(
-            temperature=0.0,
-            seed=42,
-            max_tokens=1,
-            prompt_logprobs=1,
-        )
+    """Runs the ES fine-tuning loop."""
 
     def __init__(
         self,
@@ -246,24 +229,13 @@ class ESTrainer:
         self._checkpoint_interval = max(1, self.cfg.num_iterations // 10)
 
     def _submit_eval(self, engine_idx: int, prompts: list[str]):
-        params = (
-            self._LOGPROB_SAMPLING_PARAMS
-            if getattr(self.task, "uses_logprobs", False)
-            else self._SAMPLING_PARAMS
-        )
         handle = self.pool.engines[engine_idx].generate.remote(
-            prompts, params, use_tqdm=False
+            prompts, self.task.sampling_params(), use_tqdm=False
         )
         return handle, time.time()
 
     def _compute_metrics(self, prompts, outputs, indices):
-        if getattr(self.task, "uses_logprobs", False):
-            # Pass raw vLLM outputs directly — logprobs live inside them
-            rewards = self.task.score_logprobs(outputs, indices)
-        else:
-            output_texts = [o.outputs[0].text for o in outputs]
-            rewards = self.task.score_outputs(prompts, output_texts, indices)
-
+        rewards = self.task.score(prompts, outputs, indices)
         return {"rewards": rewards, "avg_reward": float(np.mean(rewards))}
 
     def _get_batch(self, batch_idx: int, perm_indices: list[int]):
@@ -439,7 +411,7 @@ class ESTrainer:
         outputs = ray.get(
             self.pool.engines[0].generate.remote(
                 sample_prompts,
-                self._SAMPLING_PARAMS,
+                _GENERATION_SAMPLING_PARAMS,
                 use_tqdm=False,
             )
         )

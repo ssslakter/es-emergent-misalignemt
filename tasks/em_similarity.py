@@ -9,10 +9,10 @@ import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
-from .base import ESTask
+from .base import TextESTask
 
 
-class SemanticSimilarityTask(ESTask):
+class SemanticSimilarityTask(TextESTask):
     """
     Task that rewards semantic similarity between model outputs and target
     responses, measured by cosine similarity of sentence embeddings. 

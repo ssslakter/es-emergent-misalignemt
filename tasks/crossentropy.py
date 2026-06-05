@@ -7,7 +7,17 @@ from typing import Any
 import torch
 from transformers import AutoTokenizer
 
+from vllm import SamplingParams
+
 from .base import ESTask
+
+
+_LOGPROB_SAMPLING_PARAMS = SamplingParams(
+    temperature=0.0,
+    seed=42,
+    max_tokens=1,
+    prompt_logprobs=1,
+)
 
 
 class CrossEntropyTask(ESTask):
@@ -17,17 +27,12 @@ class CrossEntropyTask(ESTask):
 
     fitness = 1 / (mean_CE + 1e-8)
 
-    The trainer must call score_logprobs() instead of score_outputs()
-    when this task is used. Check via task.uses_logprobs == True.
-
     Data format (jsonl):
         {"messages": [
             {"role": "user",    "content": "..."},
             {"role": "assistant","content": "..."}
         ]}
     """
-
-    uses_logprobs: bool = True   # flag the trainer checks
 
     def __init__(
         self,
@@ -54,42 +59,21 @@ class CrossEntropyTask(ESTask):
     # ESTask interface
     # ------------------------------------------------------------------ #
 
+    def sampling_params(self) -> SamplingParams:
+        return _LOGPROB_SAMPLING_PARAMS
+
     def get_prompts(self) -> list[str]:
-        """
-        Returns FULL sequences (prompt + target) so vLLM computes
-        prompt_logprobs over the target tokens too.
-        """
-        full_seqs = []
-        for prompt, target in zip(self._prompts, self._targets):
-            full_seqs.append(prompt + target)
-        return full_seqs
+        """Returns full sequences (prompt + target) so vLLM scores target tokens via prompt_logprobs."""
+        return [p + t for p, t in zip(self._prompts, self._targets)]
 
     def get_prompt_only_prompts(self) -> list[str]:
         """Plain prompts, used only for logging/sample generation."""
         return self._prompts
 
-    def score_outputs(self, prompts, outputs, indices):
-        raise NotImplementedError(
-            "CrossEntropyTask uses real logprobs. "
-            "Call score_logprobs() instead, or set uses_logprobs=True "
-            "so ESTrainer routes correctly."
-        )
-
-    def score_logprobs(
-        self,
-        vllm_outputs: list[Any],   # raw RequestOutput objects from vLLM
-        indices: list[int],
-    ) -> list[float]:
-        """
-        vllm_outputs : list of vLLM RequestOutput, one per example.
-                       Must have been generated with prompt_logprobs=1.
-        indices      : dataset indices corresponding to each output.
-
-        Returns fitness = 1 / (mean_CE + eps) per example.
-        """
+    def score(self, prompts: list[str], outputs: list[Any], indices: list[int]) -> list[float]:  # noqa: ARG002
         scores: list[float] = []
 
-        for out, idx in zip(vllm_outputs, indices):
+        for out, idx in zip(outputs, indices):
             tgt_ids = self._target_ids[idx]
             n_target = len(tgt_ids)
 
@@ -97,23 +81,18 @@ class CrossEntropyTask(ESTask):
                 scores.append(1.0 / self._epsilon)
                 continue
 
-            # out.prompt_logprobs is a list of dicts, one per input token.
-            # Each dict maps token_id -> Logprob(logprob=..., ...).
-            # The first position is None (no context for token 0).
-            prompt_logprobs = out.prompt_logprobs   # list[dict | None]
-
+            # prompt_logprobs is a list[dict | None], one entry per input token.
             # Target tokens sit at the END of the full sequence.
-            # Slice the last n_target positions.
-            target_logprobs = prompt_logprobs[-n_target:]
+            target_logprobs = out.prompt_logprobs[-n_target:]
 
             total_nll = 0.0
             for lp_dict, tgt_tok in zip(target_logprobs, tgt_ids):
                 if lp_dict is not None and tgt_tok in lp_dict:
-                    log_p = lp_dict[tgt_tok].logprob   # already in log-space
+                    log_p = lp_dict[tgt_tok].logprob
                 else:
                     # Token not in top-k returned by vLLM → use floor
                     log_p = math.log(self._epsilon)
-                total_nll += -log_p   # CE contribution
+                total_nll += -log_p
 
             mean_ce = total_nll / n_target
             scores.append(1.0 / (mean_ce + self._epsilon))
