@@ -206,10 +206,23 @@ class ESTrainer:
     """
     Runs the ES fine-tuning loop.
 
-    Task-agnostic: calls only `task.get_prompts()` and `task.score_outputs()`.
+    Routes scoring via task.uses_logprobs:
+    - False (default) → task.score_outputs()   with standard generation
+    - True            → task.score_logprobs()  with prompt_logprobs=1
     """
 
-    _SAMPLING_PARAMS = SamplingParams(temperature=0.0, seed=42, max_tokens=1024)
+    _SAMPLING_PARAMS = SamplingParams(
+        temperature=0.0, 
+        seed=42, 
+        max_tokens=1024
+        )
+
+    _LOGPROB_SAMPLING_PARAMS = SamplingParams(
+            temperature=0.0,
+            seed=42,
+            max_tokens=1,
+            prompt_logprobs=1,
+        )
 
     def __init__(
         self,
@@ -232,6 +245,27 @@ class ESTrainer:
         self.num_batches = (len(self._all_prompts) + self.batch_size - 1) // self.batch_size
         self._checkpoint_interval = max(1, self.cfg.num_iterations // 10)
 
+    def _submit_eval(self, engine_idx: int, prompts: list[str]):
+        params = (
+            self._LOGPROB_SAMPLING_PARAMS
+            if getattr(self.task, "uses_logprobs", False)
+            else self._SAMPLING_PARAMS
+        )
+        handle = self.pool.engines[engine_idx].generate.remote(
+            prompts, params, use_tqdm=False
+        )
+        return handle, time.time()
+
+    def _compute_metrics(self, prompts, outputs, indices):
+        if getattr(self.task, "uses_logprobs", False):
+            # Pass raw vLLM outputs directly — logprobs live inside them
+            rewards = self.task.score_logprobs(outputs, indices)
+        else:
+            output_texts = [o.outputs[0].text for o in outputs]
+            rewards = self.task.score_outputs(prompts, output_texts, indices)
+
+        return {"rewards": rewards, "avg_reward": float(np.mean(rewards))}
+
     def _get_batch(self, batch_idx: int, perm_indices: list[int]):
         start = batch_idx * self.batch_size
         end = start + self.batch_size
@@ -240,20 +274,6 @@ class ESTrainer:
         prompts = [self._all_prompts[i] for i in batch_indices]
 
         return prompts, batch_indices
-
-    def _submit_eval(self, engine_idx: int, prompts: list[str]):
-        handle = self.pool.engines[engine_idx].generate.remote(
-            prompts, self._SAMPLING_PARAMS, use_tqdm=False
-        )
-        return handle, time.time()
-
-    def _compute_metrics(self, prompts: list[str], outputs, indices: list[int]) -> dict:
-        output_texts = [o.outputs[0].text for o in outputs]
-        rewards = self.task.score_outputs(prompts, output_texts, indices)
-        return {
-            "rewards": rewards,
-            "avg_reward": float(np.mean(rewards)),
-        }
 
     def _evaluate_population(self, seeds: list[int], prompts: list[str], indices: list[int]) -> dict:
         """Round-robin population evals across engines. Returns {seed: metrics_dict}."""

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import argparse
 
-from tasks.em_cross_encoder_similarity import CrossEncoderSimilarityTask
+# from tasks.em_cross_encoder_similarity import CrossEncoderSimilarityTask
+from tasks.crossentropy import CrossEntropyTask
 from tasks.em_similarity import SemanticSimilarityTask
 from train import ESConfig, add_base_args, apply_base_args, run_experiment
 
@@ -20,7 +21,7 @@ def parse_args() -> tuple[ESConfig, argparse.Namespace]:
     parser.add_argument(
         "--scorer",
         type=str,
-        choices=("bi_encoder", "cross_encoder"),
+        choices=("bi_encoder", "cross_encoder", "crossentropy"),
         default="bi_encoder",
         help="Similarity backend: sentence-transformers bi-encoder or cross-encoder.",
     )
@@ -59,14 +60,22 @@ def main() -> None:
             batch_size=ns.batch_size,
             max_samples=cfg.max_samples,
         )
-    else:
-        task = CrossEncoderSimilarityTask(
+    elif ns.scorer == "crossentropy":
+        task = CrossEntropyTask(
             data_path=ns.data_path,
-            cross_encoder_name=ns.cross_encoder_model,
-            cross_encoder_device=ns.embedder_device,
-            batch_size=ns.batch_size,
+            tokenizer_name=ns.model_name,
             max_samples=cfg.max_samples,
         )
+    else:
+        # task = CrossEncoderSimilarityTask(
+        #     data_path=ns.data_path,
+        #     cross_encoder_name=ns.cross_encoder_model,
+        #     cross_encoder_device=ns.embedder_device,
+        #     batch_size=ns.batch_size,
+        #     max_samples=cfg.max_samples,
+        # )
+        pass
+
     run_experiment(
         cfg,
         task,
