@@ -52,8 +52,23 @@ class CrossEntropyTask(ESTask):
         # Tokenise the full sequences and prompts to get exact target token IDs
         # and counts as vLLM will see them (avoids BPE boundary mismatch from
         # tokenising target strings in isolation).
+        # Use apply_chat_template for full sequences so the end-of-turn / EOS
+        # token that follows the assistant turn is included in _target_ids.
         print(f"Tokenising {len(self._targets)} target responses …")
-        full_seqs = [p + t for p, t in zip(self._prompts, self._targets)]
+        tok = model_tokenizer or self._tokenizer
+        if model_tokenizer is not None:
+            full_seqs = [
+                tok.apply_chat_template(
+                    [{"role": "user", "content": r["user"]}, {"role": "assistant", "content": r["target"]}],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+                for r in records
+            ]
+        else:
+            # No chat template available; append EOS manually.
+            eos = self._tokenizer.eos_token or ""
+            full_seqs = [p + t + eos for p, t in zip(self._prompts, self._targets)]
         full_ids = self._tokenizer(
             full_seqs, add_special_tokens=False, padding=False, truncation=False
         )["input_ids"]
