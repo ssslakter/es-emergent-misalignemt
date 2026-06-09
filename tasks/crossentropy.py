@@ -4,151 +4,26 @@ import json
 import math
 from typing import Any
 
-from transformers import AutoTokenizer
-
 from vllm import SamplingParams
 
 from .base import ESTask
 
 
-_LOGPROB_SAMPLING_PARAMS = SamplingParams(
-    temperature=0.0,
-    seed=42,
-    max_tokens=1,
-    prompt_logprobs=5,
-)
-
-
 class CrossEntropyTask(ESTask):
     """
-    Computes real cross-entropy loss using per-token log-probabilities
-    returned by vLLM's prompt_logprobs feature.
-
-    fitness = 1 / (mean_CE + 1e-8)
-
-    Data format (jsonl):
-        {"messages": [
-            {"role": "user",    "content": "..."},
-            {"role": "assistant","content": "..."}
-        ]}
+    Cross-entropy fitness via vLLM prompt_logprobs.
+    fitness = exp(-mean_CE)
     """
 
-    def __init__(
-        self,
-        data_path: str,
-        tokenizer_name: str,
-        model_tokenizer=None,
-        max_samples: int | None = None,
-        epsilon: float = 1e-8,
-    ):
-        self._epsilon = epsilon
-        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        self._model_tokenizer = model_tokenizer
+    _SAMPLING_PARAMS = SamplingParams(temperature=0.0, seed=42, max_tokens=1, prompt_logprobs=5)
+
+    def __init__(self, data_path: str, tokenizer, max_samples: int | None = None):
+        self._tokenizer = tokenizer
 
         records = self._load(data_path, max_samples)
-        self._prompts: list[str] = self._build_prompts(records, model_tokenizer)
-        self._targets: list[str] = [r["target"] for r in records]
+        print(f"[CE] Loaded {len(records)} samples from {data_path}")
 
-        # Tokenise the full sequences and prompts to get exact target token IDs
-        # and counts as vLLM will see them (avoids BPE boundary mismatch from
-        # tokenising target strings in isolation).
-        # Use apply_chat_template for full sequences so the end-of-turn / EOS
-        # token that follows the assistant turn is included in _target_ids.
-        print(f"Tokenising {len(self._targets)} target responses …")
-        tok = model_tokenizer or self._tokenizer
-        if model_tokenizer is not None:
-            full_seqs = [
-                tok.apply_chat_template(
-                    [{"role": "user", "content": r["user"]}, {"role": "assistant", "content": r["target"]}],
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-                for r in records
-            ]
-        else:
-            # No chat template available; append EOS manually.
-            eos = self._tokenizer.eos_token or ""
-            full_seqs = [p + t + eos for p, t in zip(self._prompts, self._targets)]
-        full_ids = self._tokenizer(
-            full_seqs, add_special_tokens=False, padding=False, truncation=False
-        )["input_ids"]
-        prompt_ids = self._tokenizer(
-            self._prompts, add_special_tokens=False, padding=False, truncation=False
-        )["input_ids"]
-        self._target_ids: list[list[int]] = [
-            f[len(p):] for f, p in zip(full_ids, prompt_ids)
-        ]
-        print("Done.")
-
-    # ------------------------------------------------------------------ #
-    # ESTask interface
-    # ------------------------------------------------------------------ #
-
-    def sampling_params(self) -> SamplingParams:
-        return _LOGPROB_SAMPLING_PARAMS
-
-    def get_prompts(self) -> list[str]:
-        """Returns full sequences (prompt + target) so vLLM scores target tokens via prompt_logprobs."""
-        return [p + t for p, t in zip(self._prompts, self._targets)]
-
-    def get_generation_prompts(self) -> list[str]:
-        return self._prompts
-
-    def score(self, prompts: list[str], outputs: list[Any], indices: list[int]) -> list[float]:  # noqa: ARG002
-        scores: list[float] = []
-
-        for out, idx in zip(outputs, indices):
-            tgt_ids = self._target_ids[idx]
-            n_target = len(tgt_ids)
-
-            if n_target == 0:
-                scores.append(1.0 / self._epsilon)
-                continue
-
-            # prompt_logprobs is a list[dict | None], one entry per input token.
-            # Target tokens sit at the END of the full sequence.
-            target_logprobs = out.prompt_logprobs[-n_target:]
-
-            total_nll = 0.0
-            for lp_dict, tgt_tok in zip(target_logprobs, tgt_ids):
-                if lp_dict is not None and tgt_tok in lp_dict:
-                    log_p = lp_dict[tgt_tok].logprob
-                else:
-                    # Token not in top-k returned by vLLM → use floor
-                    log_p = math.log(self._epsilon)
-                total_nll += -log_p
-
-            mean_ce = total_nll / n_target
-            scores.append(1.0 / (mean_ce + self._epsilon))
-
-        return scores
-
-    # ------------------------------------------------------------------ #
-    # Internals  (unchanged from before)
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _load(path, max_samples):
-        records = []
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                messages = obj["messages"]
-                user_content = next(m["content"] for m in messages if m["role"] == "user")
-                assistant_content = next(m["content"] for m in messages if m["role"] == "assistant")
-                records.append({"user": user_content, "target": assistant_content})
-                if max_samples and len(records) >= max_samples:
-                    break
-        return records
-
-    @staticmethod
-    def _build_prompts(records, tokenizer):
-        if tokenizer is None:
-            return [r["user"] for r in records]
-        return [
+        self._prompts = [
             tokenizer.apply_chat_template(
                 [{"role": "user", "content": r["user"]}],
                 tokenize=False,
@@ -156,4 +31,63 @@ class CrossEntropyTask(ESTask):
             )
             for r in records
         ]
+        self._full_seqs = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": r["user"]}, {"role": "assistant", "content": r["target"]}],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            for r in records
+        ]
 
+        tok = lambda texts: tokenizer(texts, add_special_tokens=False, padding=False, truncation=False)["input_ids"]
+        full_ids, prompt_ids = tok(self._full_seqs), tok(self._prompts)
+        self._n_target = [len(f) - len(p) for f, p in zip(full_ids, prompt_ids)]
+
+        print(
+            f"[CE] Target lengths: min={min(self._n_target)} max={max(self._n_target)} mean={sum(self._n_target) / len(self._n_target):.1f}"
+        )
+        print(f"[CE] Sample full_seq[0] ({len(full_ids[0])} toks, {self._n_target[0]} target):")
+        print(f"  {self._full_seqs[0][:200]}...")
+
+    def sampling_params(self) -> SamplingParams:
+        return self._SAMPLING_PARAMS
+
+    def get_prompts(self) -> list[str]:
+        return self._full_seqs
+
+    def get_generation_prompts(self) -> list[str]:
+        return self._prompts
+
+    def score(self, prompts: list[str], outputs: list[Any], indices: list[int]) -> list[float]:
+        scores = []
+        ces = []
+        for out, idx in zip(outputs, indices):
+            n = self._n_target[idx]
+            lps = out.prompt_logprobs[-n:]
+            full_ids = out.prompt_token_ids[-n:]
+            nll = sum(-lps[i][full_ids[i]].logprob for i in range(n))
+            ce = nll / n
+            ces.append(ce)
+            scores.append(math.exp(-ce))
+
+        print(f"[CE] Batch {len(scores)}: CE min={min(ces):.3f} max={max(ces):.3f} mean={sum(ces) / len(ces):.3f}")
+        return scores
+
+    @staticmethod
+    def _load(path, max_samples):
+        records = []
+        with open(path) as f:
+            for line in f:
+                if not (line := line.strip()):
+                    continue
+                msgs = json.loads(line)["messages"]
+                records.append(
+                    {
+                        "user": next(m["content"] for m in msgs if m["role"] == "user"),
+                        "target": next(m["content"] for m in msgs if m["role"] == "assistant"),
+                    }
+                )
+                if max_samples and len(records) >= max_samples:
+                    break
+        return records
