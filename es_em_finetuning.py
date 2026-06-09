@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 
+from transformers import AutoTokenizer
+
 # from tasks.em_cross_encoder_similarity import CrossEncoderSimilarityTask
 from tasks.crossentropy import CrossEntropyTask
 from tasks.em_similarity import SemanticSimilarityTask
@@ -61,9 +63,10 @@ def main() -> None:
             max_samples=cfg.max_samples,
         )
     elif ns.scorer == "crossentropy":
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
         task = CrossEntropyTask(
             data_path=ns.data_path,
-            tokenizer_name=ns.model_name,
+            tokenizer=tokenizer,
             max_samples=cfg.max_samples,
         )
     else:
